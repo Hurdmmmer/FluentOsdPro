@@ -1,0 +1,59 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>FluentOsdPro</RootNamespace>
+    <AssemblyName>FluentOsdPro</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon Condition="Exists('Assets\app.ico')">Assets\app.ico</ApplicationIcon>
+    <PlatformTarget>AnyCPU</PlatformTarget>
+    <Prefer32Bit>false</Prefer32Bit>
+    <Deterministic>true</Deterministic>
+    <Version>2.0.0</Version>
+    <FileVersion>2.0.0.0</FileVersion>
+    <AssemblyVersion>2.0.0.0</AssemblyVersion>
+    <Product>Fluent OSD Pro</Product>
+    <AssemblyTitle>Fluent OSD Pro</AssemblyTitle>
+    <Description>Fluent OSD Pro - Caret-Following IME OSD, 120Hz Motion Presets, Fluent Volume &amp; CapsLock Flyout, and Remote VDI Guard</Description>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)'=='Release'">
+    <Optimize>true</Optimize>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="Accessibility" />
+    <Reference Include="UIAutomationClient" />
+    <Reference Include="UIAutomationTypes" />
+    <EmbeddedResource Include="Assets\app.ico" LogicalName="FluentOsdPro.Assets.app.ico" Condition="Exists('Assets\app.ico')" />
+    <EmbeddedResource Include="Assets\tray_light.ico" LogicalName="FluentOsdPro.Assets.tray_light.ico" Condition="Exists('Assets\tray_light.ico')" />
+    <EmbeddedResource Include="Assets\tray_dark.ico" LogicalName="FluentOsdPro.Assets.tray_dark.ico" Condition="Exists('Assets\tray_dark.ico')" />
+  </ItemGroup>
+
+  <Target Name="StopRunningInstanceBeforeBuild" BeforeTargets="BeforeBuild;CopyFilesToOutputDirectory">
+    <Exec Command="schtasks.exe /End /TN &quot;FluentOsdPro&quot; 2&gt;nul" IgnoreExitCode="true" />
+    <Exec Command="schtasks.exe /End /TN &quot;UULocalVolumeGuard&quot; 2&gt;nul" IgnoreExitCode="true" />
+    <Exec Command="taskkill /F /IM FluentOsdPro.exe 2&gt;nul" IgnoreExitCode="true" />
+    <Exec Command="taskkill /F /IM UULocalVolumeGuard.exe 2&gt;nul" IgnoreExitCode="true" />
+    <Exec Command="if exist &quot;$(TargetPath)&quot; (del /F /Q &quot;$(TargetDir)FluentOsdPro.old.exe&quot; 2&gt;nul &amp; move /Y &quot;$(TargetPath)&quot; &quot;$(TargetDir)FluentOsdPro.old.exe&quot; 2&gt;nul)" IgnoreExitCode="true" />
+  </Target>
+
+  <Target Name="GenerateIconsIfMissing" AfterTargets="Build" Condition="!Exists('$(ProjectDir)Assets\app.ico')">
+    <Exec Command="&quot;$(TargetPath)&quot; --generate-icon &quot;$(ProjectDir)Assets&quot;" />
+  </Target>
+
+  <Target Name="LaunchAfterBuildTarget" AfterTargets="Build" Condition="'$(LaunchAfterBuild)'=='true'">
+    <Exec Command="explorer.exe &quot;$(TargetPath)&quot;" IgnoreExitCode="true" />
+  </Target>
+
+  <Target Name="RestartScheduledTaskAfterReleaseBuild" AfterTargets="Build" Condition="'$(Configuration)'=='Release'">
+    <Exec Command="schtasks.exe /Run /TN &quot;FluentOsdPro&quot; 2&gt;nul" IgnoreExitCode="true" />
+  </Target>
+
+</Project>
