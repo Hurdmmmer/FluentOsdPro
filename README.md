@@ -63,7 +63,7 @@
 ## 🙏 致谢与借鉴项目 (`Acknowledgements & Credits`)
 
 ### 🤖 AI 结对编程与动效设计 (`AI Pair Programming`)
-本项目由 **[Jimmy (@Hurdmmmer)](https://github.com/Hurdmmmer)** 与 **Google DeepMind Antigravity** 深度结对编程共同打造：
+本项目由 **Google DeepMind Antigravity** 深度结对编程共同打造：
 - **Google DeepMind Antigravity**：负责全栈架构设计、Win32 / IMM32 / UIAutomation / GDI 底层光标追踪引擎实现、零白屏亚克力双浮窗渲染、Kero (`MyGoSurface`) 终端分界线与闪烁帧补偿算法以及全量代码审查与调优。
 - **UI Motion & Animation Subagent (Claude)**：协助诊断微交互曲线并共同设计 5 套 120Hz 浮窗切换动画预设（`SpringPop` / `SmoothFade` / `CrispSlide` / `PulseMorph` / `None`）。
 
