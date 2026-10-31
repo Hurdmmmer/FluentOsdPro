@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -226,14 +226,14 @@ namespace FluentOsdPro
             if (isChinese)
             {
                 _textGuard.Text = "已启动 UU / VDI 拦截";
-                _textSettings.Text = "设置与浮窗位置...";
+                _textSettings.Text = "设置与切换动画...";
                 _textAutoStart.Text = "开机自动启动";
                 _textExit.Text = "退出";
             }
             else
             {
                 _textGuard.Text = "Enable UU / VDI Guard";
-                _textSettings.Text = "Settings & OSD...";
+                _textSettings.Text = "Settings & Animations...";
                 _textAutoStart.Text = "Start with Windows";
                 _textExit.Text = "Exit";
             }
@@ -297,12 +297,55 @@ namespace FluentOsdPro
             double waRight = workArea.Right / dpiX;
             double waBottom = workArea.Bottom / dpiY;
 
-            double targetLeft = curDipX - menuW + 18;
-            double targetTop = curDipY - menuH - 6;
+            System.Drawing.Rectangle bounds = screen.Bounds;
+            double scrLeft = bounds.Left / dpiX;
+            double scrTop = bounds.Top / dpiY;
+            double scrRight = bounds.Right / dpiX;
+            double scrBottom = bounds.Bottom / dpiY;
+
+            // Detect which of the 4 edges (Left / Top / Right / Bottom) the cursor/taskbar is near
+            double distLeft = Math.Abs(curDipX - scrLeft);
+            double distRight = Math.Abs(scrRight - curDipX);
+            double distTop = Math.Abs(curDipY - scrTop);
+            double distBottom = Math.Abs(scrBottom - curDipY);
+            double minHoriz = Math.Min(distLeft, distRight);
+            double minVert = Math.Min(distTop, distBottom);
+
+            double targetLeft;
+            double targetTop;
+
+            if (minHoriz < minVert && minHoriz < 96)
+            {
+                // Vertical taskbar on Right or Left edge
+                if (distRight <= distLeft)
+                {
+                    // Right-side taskbar: place popup menu to the left of the cursor/taskbar
+                    double rightLimit = Math.Min(waRight - 4, curDipX - 10);
+                    targetLeft = rightLimit - menuW;
+                }
+                else
+                {
+                    // Left-side taskbar: place popup menu to the right of the cursor/taskbar
+                    targetLeft = Math.Max(waLeft + 4, curDipX + 10);
+                }
+                targetTop = curDipY - (menuH * 0.5);
+            }
+            else if (distTop < distBottom && distTop < 96)
+            {
+                // Top-edge taskbar: place popup menu below the cursor/taskbar
+                targetLeft = curDipX - menuW + 18;
+                targetTop = Math.Max(waTop + 4, curDipY + 10);
+            }
+            else
+            {
+                // Bottom-edge taskbar (default): place popup menu above the cursor/taskbar
+                targetLeft = curDipX - menuW + 18;
+                targetTop = curDipY - menuH - 6;
+            }
 
             if (targetLeft < waLeft + 4) targetLeft = waLeft + 4;
             if (targetLeft + menuW > waRight - 4) targetLeft = waRight - menuW - 4;
-            if (targetTop < waTop + 4) targetTop = curDipY + 8;
+            if (targetTop < waTop + 4) targetTop = waTop + 4;
             if (targetTop + menuH > waBottom - 4) targetTop = waBottom - menuH - 4;
 
             Left = targetLeft;

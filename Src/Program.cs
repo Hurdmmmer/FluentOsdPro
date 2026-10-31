@@ -1273,7 +1273,9 @@ namespace FluentOsdPro
             IntPtr hPark = EnsureFocusParkingWindow(currentFg);
             if (hPark == IntPtr.Zero)
             {
-                hPark = FindWindow("Shell_TrayWnd", null);
+                // Use desktop shell window (Progman) instead of Shell_TrayWnd so auto-hide taskbars
+                // (especially 4-edge / right-side taskbars) are never forced to pop open on virtual desktop switch.
+                hPark = GetShellWindow();
             }
 
             if (hPark != IntPtr.Zero && currentFg != hPark)
@@ -1726,12 +1728,6 @@ namespace FluentOsdPro
                     }
                     return true;
                 }, IntPtr.Zero);
-
-                IntPtr startupFg = GetForegroundWindow();
-                if (startupFg == IntPtr.Zero || !IsRemoteDesktopOrVdiWindow(startupFg))
-                {
-                    EnsureTaskbarsTopmost(true);
-                }
             }
             catch (Exception ex)
             {
@@ -2129,7 +2125,10 @@ namespace FluentOsdPro
             _imeMonitor?.Dispose();
             _imeMonitor = null;
 
-            EnsureTaskbarsTopmost(true);
+            if (_lastCheckedTaskbarRemoteSuppressed)
+            {
+                EnsureTaskbarsTopmost(true);
+            }
             UninstallKeyboardHook("ProcessExit");
 
             if (_winEventHookFg != IntPtr.Zero)

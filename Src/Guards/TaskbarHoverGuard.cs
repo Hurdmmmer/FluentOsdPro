@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -65,6 +65,27 @@ namespace FluentOsdPro
 
         [DllImport("user32.dll", SetLastError = true)]
         private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+
+        [DllImport("shell32.dll", SetLastError = true)]
+        private static extern IntPtr SHAppBarMessage(uint dwMessage, ref APPBARDATA pData);
+
+        private const uint ABM_GETTASKBARPOS = 0x00000005;
+        private const uint ABM_GETSTATE = 0x00000004;
+        private const int ABE_LEFT = 0;
+        private const int ABE_TOP = 1;
+        private const int ABE_RIGHT = 2;
+        private const int ABE_BOTTOM = 3;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct APPBARDATA
+        {
+            public int cbSize;
+            public IntPtr hWnd;
+            public uint uCallbackMessage;
+            public uint uEdge;
+            public Win32Rect rc;
+            public IntPtr lParam;
+        }
 
         [StructLayout(LayoutKind.Sequential)]
         private struct Win32Point
@@ -318,6 +339,95 @@ namespace FluentOsdPro
             return false;
         }
 
+        /// <summary>
+        /// Detects the docked edge (ABE_LEFT=0, ABE_TOP=1, ABE_RIGHT=2, ABE_BOTTOM=3) and screen rectangle
+        /// of the taskbar on the specified monitor (supports Windows 11 4-edge taskbars / Windhawk vertical taskbars).
+        /// </summary>
+        private static int GetTaskbarEdgeAndRect(IntPtr hMonitor, out Win32Rect trayRect)
+        {
+            trayRect = new Win32Rect();
+            try
+            {
+                IntPtr primaryTray = FindWindow("Shell_TrayWnd", null);
+                IntPtr targetTray = primaryTray;
+
+                if (hMonitor != IntPtr.Zero && primaryTray != IntPtr.Zero)
+                {
+                    IntPtr primaryMon = MonitorFromWindow(primaryTray, MONITOR_DEFAULTTONEAREST);
+                    if (primaryMon != hMonitor)
+                    {
+                        IntPtr sec = IntPtr.Zero;
+                        while ((sec = FindWindowEx(IntPtr.Zero, sec, "Shell_SecondaryTrayWnd", null)) != IntPtr.Zero)
+                        {
+                            if (MonitorFromWindow(sec, MONITOR_DEFAULTTONEAREST) == hMonitor)
+                            {
+                                targetTray = sec;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (targetTray != IntPtr.Zero && GetWindowRect(targetTray, out trayRect))
+                {
+                    IntPtr mon = hMonitor != IntPtr.Zero ? hMonitor : MonitorFromWindow(targetTray, MONITOR_DEFAULTTONEAREST);
+                    if (mon != IntPtr.Zero)
+                    {
+                        Win32MonitorInfo mi = new Win32MonitorInfo { cbSize = Marshal.SizeOf(typeof(Win32MonitorInfo)) };
+                        if (GetMonitorInfo(mon, ref mi))
+                        {
+                            int trayW = Math.Max(1, trayRect.Right - trayRect.Left);
+                            int trayH = Math.Max(1, trayRect.Bottom - trayRect.Top);
+                            int monMidX = (mi.rcMonitor.Left + mi.rcMonitor.Right) / 2;
+                            int monMidY = (mi.rcMonitor.Top + mi.rcMonitor.Bottom) / 2;
+                            int trayMidX = (trayRect.Left + trayRect.Right) / 2;
+                            int trayMidY = (trayRect.Top + trayRect.Bottom) / 2;
+
+                            // Vertical taskbar (Left or Right edge)
+                            if (trayH > trayW)
+                            {
+                                return trayMidX >= monMidX ? ABE_RIGHT : ABE_LEFT;
+                            }
+                            // Horizontal taskbar (Top or Bottom edge)
+                            return trayMidY <= monMidY ? ABE_TOP : ABE_BOTTOM;
+                        }
+                    }
+                }
+
+                APPBARDATA abd = new APPBARDATA { cbSize = Marshal.SizeOf(typeof(APPBARDATA)) };
+                if (SHAppBarMessage(ABM_GETTASKBARPOS, ref abd) != IntPtr.Zero)
+                {
+                    trayRect = abd.rc;
+                    if (abd.uEdge <= ABE_BOTTOM)
+                    {
+                        return (int)abd.uEdge;
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            return ABE_BOTTOM;
+        }
+
+        private static bool IsCursorAtTaskbarMonitorEdge(Win32Point pt, IntPtr hMon, Win32MonitorInfo mi)
+        {
+            Win32Rect trayRect;
+            int edge = GetTaskbarEdgeAndRect(hMon, out trayRect);
+            switch (edge)
+            {
+                case ABE_LEFT:
+                    return pt.X >= mi.rcMonitor.Left && pt.X <= mi.rcMonitor.Left + 2;
+                case ABE_RIGHT:
+                    return pt.X >= mi.rcMonitor.Right - 2 && pt.X <= mi.rcMonitor.Right;
+                case ABE_TOP:
+                    return pt.Y >= mi.rcMonitor.Top && pt.Y <= mi.rcMonitor.Top + 2;
+                default:
+                    return pt.Y >= mi.rcMonitor.Bottom - 2 && pt.Y <= mi.rcMonitor.Bottom;
+            }
+        }
+
         private static void EnsureTaskbarHoverWakeupForWindow(IntPtr hwnd, string reason)
         {
             if (_inDesktopSwitchSession)
@@ -334,10 +444,6 @@ namespace FluentOsdPro
                     _lastCheckedTaskbarWakeupFullOrMax = false;
                     EnsureTaskbarsTopmost(true);
                     LogInfo("Restored local taskbar topmost after leaving fullscreen remote/VDI window (Reason=" + reason + ").");
-                }
-                else
-                {
-                    EnsureTaskbarsTopmost(false);
                 }
                 return;
             }
@@ -405,14 +511,14 @@ namespace FluentOsdPro
                             EnsureTaskbarsTopmost(true);
                             LogInfo("Restored local taskbar wakeup for windowed remote/VDI window (HWND=" + hwnd + ", Reason=" + reason + ").");
                         }
-                        else
-                        {
-                            EnsureTaskbarsTopmost(false);
-                        }
                     }
                     return;
                 }
 
+                // Local window path:
+                // IMPORTANT: Do NOT call EnsureTaskbarsTopmost(true) or MarkWindowNotFullscreen / SWP_FRAMECHANGED
+                // on normal local window or virtual desktop switches! Doing so forces Windows 11's auto-hide taskbar
+                // (especially 4-edge / right-docked taskbars) to pop out and stay stuck visible during Win+Ctrl+Left/Right.
                 bool propAdded = false;
                 if (GetProp(hwnd, "NonRudeHWND") == IntPtr.Zero)
                 {
@@ -428,33 +534,18 @@ namespace FluentOsdPro
                 }
 
                 bool wasRemoteSuppressed = _lastCheckedTaskbarRemoteSuppressed;
-                bool stateChanged = (hwnd != _lastCheckedTaskbarWakeupHwnd) ||
-                                    (isFullOrMax != _lastCheckedTaskbarWakeupFullOrMax) ||
-                                    wasRemoteSuppressed ||
-                                    propAdded;
-
                 _lastCheckedTaskbarWakeupHwnd = hwnd;
                 _lastCheckedTaskbarWakeupFullOrMax = isFullOrMax;
                 _lastCheckedTaskbarRemoteSuppressed = false;
 
-                if (isFullOrMax && stateChanged)
+                if (wasRemoteSuppressed)
                 {
-                    MarkWindowNotFullscreen(hwnd);
-                    if (coreWnd != IntPtr.Zero)
-                    {
-                        MarkWindowNotFullscreen(coreWnd);
-                    }
-                    if (propAdded)
-                    {
-                        SetWindowPos(hwnd, IntPtr.Zero, 0, 0, 0, 0,
-                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOSENDCHANGING);
-                    }
                     EnsureTaskbarsTopmost(true);
-                    LogInfo("Applied NonRudeHWND & taskbar topmost guard for fullscreen/maximized window (HWND=" + hwnd + ", Reason=" + reason + ").");
+                    LogInfo("Restored local taskbar topmost after switching from fullscreen remote/VDI to local window (HWND=" + hwnd + ", Reason=" + reason + ").");
                 }
-                else
+                else if (propAdded && isFullOrMax)
                 {
-                    EnsureTaskbarsTopmost(wasRemoteSuppressed);
+                    LogInfo("Applied NonRudeHWND property for maximized/fullscreen local window (HWND=" + hwnd + ", Reason=" + reason + ").");
                 }
 
                 if (isFullOrMax)
@@ -466,9 +557,9 @@ namespace FluentOsdPro
                         if (hMon != IntPtr.Zero)
                         {
                             Win32MonitorInfo mi = new Win32MonitorInfo { cbSize = Marshal.SizeOf(typeof(Win32MonitorInfo)) };
-                            if (GetMonitorInfo(hMon, ref mi) && pt.Y >= mi.rcMonitor.Bottom - 2 && pt.Y <= mi.rcMonitor.Bottom)
+                            if (GetMonitorInfo(hMon, ref mi) && IsCursorAtTaskbarMonitorEdge(pt, hMon, mi))
                             {
-                                EnsureTaskbarsTopmost(true);
+                                EnsureTaskbarsTopmost(false);
                             }
                         }
                     }
