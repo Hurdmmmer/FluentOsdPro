@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
@@ -30,6 +30,14 @@ namespace FluentOsdPro
         }
 
         private const int WmMouseActivate = 0x0021;
+        private const int WmEraseBkgnd = 0x0014;
+        private const int WmDisplayChange = 0x007E;
+        private const int WmPowerBroadcast = 0x0218;
+        private const int WmSettingChange = 0x001A;
+        private const int WmThemeChanged = 0x031A;
+        private const int WmDwmCompositionChanged = 0x031E;
+        private const int WmDwmColorizationColorChanged = 0x0320;
+        private const int GclpHbrBackground = -10;
         private const int MaNoActivate = 3;
         private const int SwHide = 0;
         private const int SwShowNoActivate = 4;
@@ -75,6 +83,38 @@ namespace FluentOsdPro
 
         [DllImport("user32.dll")]
         private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll", EntryPoint = "SetClassLongPtrW", SetLastError = true)]
+        private static extern IntPtr SetClassLongPtr64(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
+
+        [DllImport("user32.dll", EntryPoint = "SetClassLongW", SetLastError = true)]
+        private static extern uint SetClassLong32(IntPtr hWnd, int nIndex, uint dwNewLong);
+
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmFlush();
+
+        private static void ClearWindowClassBackgroundBrush(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return;
+            try
+            {
+                if (IntPtr.Size == 8)
+                {
+                    SetClassLongPtr64(hwnd, GclpHbrBackground, IntPtr.Zero);
+                }
+                else
+                {
+                    SetClassLong32(hwnd, GclpHbrBackground, 0);
+                }
+            }
+            catch
+            {
+            }
+        }
 
         [DllImport("winmm.dll")]
         private static extern uint timeBeginPeriod(uint uPeriod);
@@ -318,6 +358,8 @@ namespace FluentOsdPro
             base.OnSourceInitialized(e);
             _hwnd = new WindowInteropHelper(this).Handle;
 
+            ClearWindowClassBackgroundBrush(_hwnd);
+
             HwndSource source = HwndSource.FromHwnd(_hwnd);
             if (source?.CompositionTarget != null)
             {
@@ -334,6 +376,31 @@ namespace FluentOsdPro
             {
                 handled = true;
                 return new IntPtr(MaNoActivate);
+            }
+            if (msg == WmEraseBkgnd)
+            {
+                // Suppress default Win32 white background erase completely
+                handled = true;
+                return new IntPtr(1);
+            }
+            if (msg == WmDisplayChange ||
+                msg == WmPowerBroadcast ||
+                msg == WmSettingChange ||
+                msg == WmThemeChanged ||
+                msg == WmDwmCompositionChanged ||
+                msg == WmDwmColorizationColorChanged)
+            {
+                // Re-assert DWM Acrylic & theme brushes offscreen immediately on lid close/open,
+                // battery/AC switch, sleep resume, or display topology change so the next popup never flashes white!
+                Dispatcher.BeginInvoke(DispatcherPriority.Render, new Action(() =>
+                {
+                    if (_hwnd != IntPtr.Zero)
+                    {
+                        ApplyTheme(force: true);
+                        InvalidateVisual();
+                        UpdateLayout();
+                    }
+                }));
             }
             return IntPtr.Zero;
         }
@@ -363,6 +430,7 @@ namespace FluentOsdPro
             {
                 Left = -32000;
                 Top = -32000;
+                _cardBorder.Opacity = 0.0;
                 Show();
                 UpdateLayout();
                 if (_hwnd != IntPtr.Zero)
@@ -409,7 +477,9 @@ namespace FluentOsdPro
                 Prewarm();
             }
 
-            ApplyTheme(force: false);
+            // Force DWM Acrylic & theme brush re-assertion whenever waking from Hidden state
+            // so lid-close / sleep-resume / battery-saver transitions never leave an invalid DWM surface!
+            ApplyTheme(force: !IsCurrentlyVisible);
 
             bool hasVolume = state.VolumePercent >= 0;
             string deviceTitle = state.DeviceName ?? string.Empty;
@@ -459,6 +529,7 @@ namespace FluentOsdPro
                 _currentLeftDip = placement.Left;
                 Width = desiredWidthDip;
                 Height = desiredHeightDip;
+                _cardBorder.Opacity = animate ? 0.0 : 1.0;
                 UpdateLayout();
                 UpdateSliderGeometry();
 
@@ -495,7 +566,7 @@ namespace FluentOsdPro
                     WindowMotionPhase.Entering,
                     _currentTopDip,
                     _finalTopDip,
-                    Math.Max(0.05, Opacity),
+                    Math.Max(0.05, _cardBorder.Opacity),
                     1.0,
                     EnterDurationMs,
                     ensureShown: true);
@@ -515,7 +586,7 @@ namespace FluentOsdPro
                     _currentWidthDip = desiredWidthDip;
                     _currentLeftDip = placement.Left;
                     Width = desiredWidthDip;
-                    ApplyWindowBounds(_currentLeftDip, _currentTopDip, _currentWidthDip, _currentHeightDip, Opacity, ensureShown: false);
+                    ApplyWindowBounds(_currentLeftDip, _currentTopDip, _currentWidthDip, _currentHeightDip, _cardBorder.Opacity, ensureShown: false);
                 }
             }
 
@@ -637,7 +708,7 @@ namespace FluentOsdPro
                 _currentLeftDip = Math.Round(_sizeAnimCenterX - (_sizeAnimTargetW / 2.0));
                 Width = _currentWidthDip;
                 UpdateSliderGeometry();
-                ApplyWindowBounds(_currentLeftDip, _currentTopDip, _currentWidthDip, _currentHeightDip, Opacity, ensureShown: false);
+                ApplyWindowBounds(_currentLeftDip, _currentTopDip, _currentWidthDip, _currentHeightDip, _cardBorder.Opacity, ensureShown: false);
                 return;
             }
 
@@ -650,7 +721,7 @@ namespace FluentOsdPro
             _currentLeftDip = curLeft;
             Width = curW;
             UpdateSliderGeometry();
-            ApplyWindowBounds(_currentLeftDip, _currentTopDip, _currentWidthDip, _currentHeightDip, Opacity, ensureShown: false);
+            ApplyWindowBounds(_currentLeftDip, _currentTopDip, _currentWidthDip, _currentHeightDip, _cardBorder.Opacity, ensureShown: false);
         }
 
         private void OnHideTimerTick(object sender, EventArgs e)
@@ -667,7 +738,7 @@ namespace FluentOsdPro
                 WindowMotionPhase.Exiting,
                 _currentTopDip,
                 _startTopDip,
-                Opacity,
+                _cardBorder.Opacity,
                 0.0,
                 ExitDurationMs,
                 ensureShown: false);
@@ -733,6 +804,7 @@ namespace FluentOsdPro
             StopMotionLoop();
             StopResizeRendering();
             _motionPhase = WindowMotionPhase.Hidden;
+            _cardBorder.Opacity = 0.0;
             if (_hwnd != IntPtr.Zero)
             {
                 ShowWindow(_hwnd, SwHide);
@@ -744,6 +816,7 @@ namespace FluentOsdPro
         {
             _currentLeftDip = leftDip;
             _currentTopDip = topDip;
+            _cardBorder.Opacity = Math.Max(0.0, Math.Min(1.0, opacity));
 
             if (_hwnd == IntPtr.Zero)
             {
@@ -755,20 +828,57 @@ namespace FluentOsdPro
             int wPx = Math.Max(1, (int)Math.Round(widthDip * _dpiX));
             int hPx = Math.Max(1, (int)Math.Round(heightDip * _dpiY));
 
-            uint flags = SwpNoActivate | SwpNoOwnerZOrder | SwpNoSendChanging | SwpAsyncWindowPos |
-                         (ensureShown ? SwpShowWindow : 0u);
-            SetWindowPos(
-                _hwnd,
-                HwndTopMost,
-                xPx,
-                yPx,
-                wPx,
-                hPx,
-                flags);
-
             if (ensureShown)
             {
-                ShowWindow(_hwnd, SwShowNoActivate);
+                bool wasHwndVisible = IsWindowVisible(_hwnd);
+                if (!wasHwndVisible)
+                {
+                    // Wake the HWND at (-32000, -32000) first so any post-sleep / post-lid-close
+                    // DWM DirectComposition + Acrylic surface reallocation happens completely offscreen!
+                    SetWindowPos(
+                        _hwnd,
+                        HwndTopMost,
+                        -32000,
+                        -32000,
+                        wPx,
+                        hPx,
+                        SwpNoActivate | SwpNoOwnerZOrder | SwpNoSendChanging);
+                    ShowWindow(_hwnd, SwShowNoActivate);
+                    ApplyTheme(force: true);
+                    InvalidateVisual();
+                    UpdateLayout();
+                    try
+                    {
+                        DwmFlush();
+                    }
+                    catch
+                    {
+                    }
+                }
+                else
+                {
+                    UpdateLayout();
+                }
+
+                SetWindowPos(
+                    _hwnd,
+                    HwndTopMost,
+                    xPx,
+                    yPx,
+                    wPx,
+                    hPx,
+                    SwpNoActivate | SwpNoOwnerZOrder);
+            }
+            else
+            {
+                SetWindowPos(
+                    _hwnd,
+                    HwndTopMost,
+                    xPx,
+                    yPx,
+                    wPx,
+                    hPx,
+                    SwpNoActivate | SwpNoOwnerZOrder | SwpNoSendChanging);
             }
         }
 

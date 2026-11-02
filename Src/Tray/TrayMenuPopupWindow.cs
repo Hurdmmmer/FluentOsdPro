@@ -29,6 +29,7 @@ namespace FluentOsdPro
         private readonly TextBlock _textSettings;
         private readonly TextBlock _checkAutoStart;
         private readonly TextBlock _textAutoStart;
+        private readonly TextBlock _iconExit;
         private readonly TextBlock _textExit;
 
         private Brush _rowHoverBrush;
@@ -97,7 +98,8 @@ namespace FluentOsdPro
                 HideMenuAndRestoreFocus("ToggleAutoStart");
             };
 
-            _rowExit = CreateMenuRow(out _, out _textExit);
+            _rowExit = CreateMenuRow(out _iconExit, out _textExit);
+            _iconExit.Visibility = Visibility.Hidden;
             _rowExit.MouseLeftButtonUp += (s, e) =>
             {
                 _isClosing = true;

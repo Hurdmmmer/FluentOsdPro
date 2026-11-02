@@ -430,139 +430,27 @@ namespace FluentOsdPro
 
         private static void EnsureTaskbarHoverWakeupForWindow(IntPtr hwnd, string reason)
         {
-            if (_inDesktopSwitchSession)
+            // Clean up any legacy NonRudeHWND property that was previously attached to windows,
+            // and never manipulate Shell_TrayWnd Z-order or ITaskbarList2::MarkFullscreenWindow.
+            // Touching Shell_TrayWnd or NonRudeHWND causes Windows 11's auto-hide taskbar
+            // (especially 4-edge / right-side taskbars) to pop out and stay stuck visible
+            // when switching virtual desktops via Win+Ctrl+Left/Right.
+            if (hwnd == IntPtr.Zero || !IsWindow(hwnd))
             {
-                return;
-            }
-
-            if (!IsValidExternalWindow(hwnd) || IsIconic(hwnd) || IsWindowCloaked(hwnd))
-            {
-                if (_lastCheckedTaskbarRemoteSuppressed)
-                {
-                    _lastCheckedTaskbarRemoteSuppressed = false;
-                    _lastCheckedTaskbarWakeupHwnd = IntPtr.Zero;
-                    _lastCheckedTaskbarWakeupFullOrMax = false;
-                    EnsureTaskbarsTopmost(true);
-                    LogInfo("Restored local taskbar topmost after leaving fullscreen remote/VDI window (Reason=" + reason + ").");
-                }
                 return;
             }
 
             try
             {
-                int style = GetWindowLong(hwnd, GWL_STYLE);
-                if ((style & WS_CHILD) != 0) return;
-
-                int exStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
-                if ((exStyle & (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)) != 0) return;
-
-                bool isRemote = IsRemoteDesktopOrVdiWindow(hwnd);
-                bool isFullOrMax = IsWindowMaximizedOrCoveringMonitor(hwnd);
-
-                if (isRemote)
+                if (GetProp(hwnd, "NonRudeHWND") != IntPtr.Zero)
                 {
-                    bool propRemoved = false;
-                    if (GetProp(hwnd, "NonRudeHWND") != IntPtr.Zero)
-                    {
-                        RemoveProp(hwnd, "NonRudeHWND");
-                        propRemoved = true;
-                    }
-
-                    IntPtr remoteCoreWnd = FindWindowEx(hwnd, IntPtr.Zero, "Windows.UI.Core.CoreWindow", null);
-                    if (remoteCoreWnd != IntPtr.Zero && GetProp(remoteCoreWnd, "NonRudeHWND") != IntPtr.Zero)
-                    {
-                        RemoveProp(remoteCoreWnd, "NonRudeHWND");
-                        propRemoved = true;
-                    }
-
-                    bool remoteStateChanged = (hwnd != _lastCheckedTaskbarWakeupHwnd) ||
-                                              (isFullOrMax != _lastCheckedTaskbarWakeupFullOrMax) ||
-                                              (_lastCheckedTaskbarRemoteSuppressed != isFullOrMax) ||
-                                              propRemoved;
-
-                    _lastCheckedTaskbarWakeupHwnd = hwnd;
-                    _lastCheckedTaskbarWakeupFullOrMax = isFullOrMax;
-                    _lastCheckedTaskbarRemoteSuppressed = isFullOrMax;
-
-                    if (isFullOrMax)
-                    {
-                        IntPtr hMon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-                        if (remoteStateChanged)
-                        {
-                            MarkWindowFullscreen(hwnd, true);
-                            if (propRemoved)
-                            {
-                                SetWindowPos(hwnd, IntPtr.Zero, 0, 0, 0, 0,
-                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOSENDCHANGING);
-                            }
-                            SuppressTaskbarOnMonitor(hMon, true);
-                            LogInfo("Suppressed local taskbar hover wakeup for fullscreen remote/VDI window (HWND=" + hwnd + ", Reason=" + reason + ").");
-                        }
-                        else
-                        {
-                            SuppressTaskbarOnMonitor(hMon, false);
-                        }
-                    }
-                    else
-                    {
-                        if (remoteStateChanged)
-                        {
-                            MarkWindowFullscreen(hwnd, false);
-                            EnsureTaskbarsTopmost(true);
-                            LogInfo("Restored local taskbar wakeup for windowed remote/VDI window (HWND=" + hwnd + ", Reason=" + reason + ").");
-                        }
-                    }
-                    return;
-                }
-
-                // Local window path:
-                // IMPORTANT: Do NOT call EnsureTaskbarsTopmost(true) or MarkWindowNotFullscreen / SWP_FRAMECHANGED
-                // on normal local window or virtual desktop switches! Doing so forces Windows 11's auto-hide taskbar
-                // (especially 4-edge / right-docked taskbars) to pop out and stay stuck visible during Win+Ctrl+Left/Right.
-                bool propAdded = false;
-                if (GetProp(hwnd, "NonRudeHWND") == IntPtr.Zero)
-                {
-                    SetProp(hwnd, "NonRudeHWND", NonRudePropValue);
-                    propAdded = true;
+                    RemoveProp(hwnd, "NonRudeHWND");
                 }
 
                 IntPtr coreWnd = FindWindowEx(hwnd, IntPtr.Zero, "Windows.UI.Core.CoreWindow", null);
-                if (coreWnd != IntPtr.Zero && GetProp(coreWnd, "NonRudeHWND") == IntPtr.Zero)
+                if (coreWnd != IntPtr.Zero && GetProp(coreWnd, "NonRudeHWND") != IntPtr.Zero)
                 {
-                    SetProp(coreWnd, "NonRudeHWND", NonRudePropValue);
-                    propAdded = true;
-                }
-
-                bool wasRemoteSuppressed = _lastCheckedTaskbarRemoteSuppressed;
-                _lastCheckedTaskbarWakeupHwnd = hwnd;
-                _lastCheckedTaskbarWakeupFullOrMax = isFullOrMax;
-                _lastCheckedTaskbarRemoteSuppressed = false;
-
-                if (wasRemoteSuppressed)
-                {
-                    EnsureTaskbarsTopmost(true);
-                    LogInfo("Restored local taskbar topmost after switching from fullscreen remote/VDI to local window (HWND=" + hwnd + ", Reason=" + reason + ").");
-                }
-                else if (propAdded && isFullOrMax)
-                {
-                    LogInfo("Applied NonRudeHWND property for maximized/fullscreen local window (HWND=" + hwnd + ", Reason=" + reason + ").");
-                }
-
-                if (isFullOrMax)
-                {
-                    Win32Point pt;
-                    if (GetCursorPos(out pt))
-                    {
-                        IntPtr hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-                        if (hMon != IntPtr.Zero)
-                        {
-                            Win32MonitorInfo mi = new Win32MonitorInfo { cbSize = Marshal.SizeOf(typeof(Win32MonitorInfo)) };
-                            if (GetMonitorInfo(hMon, ref mi) && IsCursorAtTaskbarMonitorEdge(pt, hMon, mi))
-                            {
-                                EnsureTaskbarsTopmost(false);
-                            }
-                        }
-                    }
+                    RemoveProp(coreWnd, "NonRudeHWND");
                 }
             }
             catch

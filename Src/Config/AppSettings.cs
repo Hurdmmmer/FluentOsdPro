@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.IO;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -25,6 +25,21 @@ namespace FluentOsdPro
         None = 4         // 极速直出 (0ms instant switch, no animation)
     }
 
+    internal enum AppLanguage
+    {
+        Auto = 0,        // Follow Windows UI culture (CultureInfo.CurrentUICulture)
+        Chinese = 1,     // 简体中文
+        English = 2      // English
+    }
+
+    internal enum DesktopBoundaryFeedbackStyle
+    {
+        RubberBandBounce = 0, // 橡皮筋弹性回弹 (macOS style: pull away from boundary + spring back)
+        HorizontalShake = 1,  // 左右阻尼摇头抖动 (2.5-cycle damped horizontal head-shake)
+        ImpactThud = 2,       // 物理碰撞微震 (horizontal bounce + subtle vertical impact tremor)
+        None = 3              // 关闭 (disabled)
+    }
+
     internal sealed class AppSettings
     {
         private static readonly object SyncLock = new object();
@@ -34,6 +49,8 @@ namespace FluentOsdPro
         public bool ImeFlyoutEnabled { get; set; } = true;
         public bool CapsLockFlyoutEnabled { get; set; } = true;
         public OsdAnimationStyle StatusOsdAnimationStyle { get; set; } = OsdAnimationStyle.SpringPop;
+        public DesktopBoundaryFeedbackStyle BoundaryFeedbackStyle { get; set; } = DesktopBoundaryFeedbackStyle.RubberBandBounce;
+        public AppLanguage Language { get; set; } = AppLanguage.Auto;
 
         public bool OsdAnimationEnabled
         {
@@ -125,6 +142,28 @@ namespace FluentOsdPro
                 {
                     settings.StatusOsdPosition = (OsdPosition)posInt;
                 }
+
+                string langStr = ReadString(json, "Language", "Auto");
+                if (Enum.TryParse(langStr, true, out AppLanguage parsedLang) && Enum.IsDefined(typeof(AppLanguage), parsedLang))
+                {
+                    settings.Language = parsedLang;
+                }
+                else if (int.TryParse(langStr, out int langInt) && Enum.IsDefined(typeof(AppLanguage), langInt))
+                {
+                    settings.Language = (AppLanguage)langInt;
+                }
+
+                string boundaryStr = ReadString(json, "BoundaryFeedbackStyle", "RubberBandBounce");
+                if (Enum.TryParse(boundaryStr, true, out DesktopBoundaryFeedbackStyle parsedBoundary) &&
+                    Enum.IsDefined(typeof(DesktopBoundaryFeedbackStyle), parsedBoundary))
+                {
+                    settings.BoundaryFeedbackStyle = parsedBoundary;
+                }
+                else if (int.TryParse(boundaryStr, out int boundaryInt) &&
+                         Enum.IsDefined(typeof(DesktopBoundaryFeedbackStyle), boundaryInt))
+                {
+                    settings.BoundaryFeedbackStyle = (DesktopBoundaryFeedbackStyle)boundaryInt;
+                }
             }
             catch (Exception ex)
             {
@@ -154,7 +193,9 @@ namespace FluentOsdPro
                     sb.AppendLine("  \"CapsLockFlyoutEnabled\": " + (CapsLockFlyoutEnabled ? "true" : "false") + ",");
                     sb.AppendLine("  \"OsdAnimationEnabled\": " + (OsdAnimationEnabled ? "true" : "false") + ",");
                     sb.AppendLine("  \"StatusOsdAnimationStyle\": \"" + StatusOsdAnimationStyle.ToString() + "\",");
-                    sb.AppendLine("  \"StatusOsdPosition\": \"" + StatusOsdPosition.ToString() + "\"");
+                    sb.AppendLine("  \"StatusOsdPosition\": \"" + StatusOsdPosition.ToString() + "\",");
+                    sb.AppendLine("  \"BoundaryFeedbackStyle\": \"" + BoundaryFeedbackStyle.ToString() + "\",");
+                    sb.AppendLine("  \"Language\": \"" + Language.ToString() + "\"");
                     sb.AppendLine("}");
 
                     string tempPath = filePath + ".tmp";

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Globalization;
 using System.Windows;
 using Microsoft.Win32;
@@ -64,26 +64,24 @@ namespace FluentOsdPro
         {
             try
             {
-                if (string.Equals(CultureInfo.CurrentUICulture.TwoLetterISOLanguageName, "zh", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(CultureInfo.CurrentCulture.TwoLetterISOLanguageName, "zh", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(CultureInfo.InstalledUICulture.TwoLetterISOLanguageName, "zh", StringComparison.OrdinalIgnoreCase))
+                AppLanguage lang = AppSettings.Current.Language;
+                if (lang == AppLanguage.Chinese)
                 {
                     return true;
                 }
-
-                string tzId = TimeZoneInfo.Local.Id ?? string.Empty;
-                if (tzId.IndexOf("China", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    tzId.IndexOf("Beijing", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    tzId.IndexOf("Taipei", StringComparison.OrdinalIgnoreCase) >= 0)
+                if (lang == AppLanguage.English)
                 {
-                    return true;
+                    return false;
                 }
 
-                return false;
+                return string.Equals(
+                    CultureInfo.CurrentUICulture.TwoLetterISOLanguageName,
+                    "zh",
+                    StringComparison.OrdinalIgnoreCase);
             }
             catch
             {
-                return true;
+                return false;
             }
         }
 

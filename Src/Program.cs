@@ -712,7 +712,7 @@ namespace FluentOsdPro
                         _settingsWindow.WindowState = WindowState.Normal;
                     }
                     _settingsWindow.Show();
-                    _settingsWindow.Activate();
+                    _settingsWindow.CenterOnActiveMonitorAndBringToFront();
                 }
             }
             catch (Exception ex)
@@ -1110,14 +1110,12 @@ namespace FluentOsdPro
                 {
                     SetForegroundWindow(targetHwnd);
                     BringWindowToTop(targetHwnd);
-                    SwitchToThisWindow(targetHwnd, true);
 
                     if (GetForegroundWindow() != targetHwnd)
                     {
                         keybd_event((byte)VK_F24, 0, KEYEVENTF_KEYUP, OurInjectedExtraInfoU);
                         SetForegroundWindow(targetHwnd);
                         BringWindowToTop(targetHwnd);
-                        SwitchToThisWindow(targetHwnd, true);
                     }
                 }
                 finally
@@ -1270,11 +1268,24 @@ namespace FluentOsdPro
         private static IntPtr FocusLocalTrayWindow()
         {
             IntPtr currentFg = GetForegroundWindow();
+
+            // Prefer focusing an existing visible local application window (e.g. on another monitor)
+            // rather than a WS_EX_TOOLWINDOW parking window. In Windows 11, if a WS_EX_TOOLWINDOW or
+            // shell window holds foreground focus during a Win+Ctrl+Left/Right virtual desktop switch,
+            // explorer.exe assumes no normal app window is active and forces the auto-hide taskbar open.
+            IntPtr localAppHwnd = FindTopmostVisibleWindowOnCurrentDesktop(IntPtr.Zero);
+            if (localAppHwnd != IntPtr.Zero && !IsWindowTargetProcess(localAppHwnd))
+            {
+                SetForegroundWindow(localAppHwnd);
+                if (!IsWindowTargetProcess(GetForegroundWindow()))
+                {
+                    return GetForegroundWindow();
+                }
+            }
+
             IntPtr hPark = EnsureFocusParkingWindow(currentFg);
             if (hPark == IntPtr.Zero)
             {
-                // Use desktop shell window (Progman) instead of Shell_TrayWnd so auto-hide taskbars
-                // (especially 4-edge / right-side taskbars) are never forced to pop open on virtual desktop switch.
                 hPark = GetShellWindow();
             }
 
@@ -1301,13 +1312,11 @@ namespace FluentOsdPro
                 try
                 {
                     SetForegroundWindow(hPark);
-                    SwitchToThisWindow(hPark, true);
 
                     if (IsWindowTargetProcess(GetForegroundWindow()))
                     {
                         keybd_event((byte)VK_F24, 0, KEYEVENTF_KEYUP, OurInjectedExtraInfoU);
                         SetForegroundWindow(hPark);
-                        SwitchToThisWindow(hPark, true);
                     }
                 }
                 finally
@@ -1394,13 +1403,6 @@ namespace FluentOsdPro
                 if (idObject != OBJID_WINDOW || hwnd == IntPtr.Zero) return;
                 if (IsWindowTargetProcess(hwnd) && IsWindowCloaked(hwnd))
                 {
-                    AddCloakedTargetWindow(hwnd);
-                    IntPtr prefMon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-                    IntPtr topLocal = FindTopmostVisibleWindowOnCurrentDesktop(prefMon);
-                    if (topLocal != IntPtr.Zero)
-                    {
-                        RestoreForegroundWindow(topLocal, "WinEvent_TargetCloaked_FocusLocal");
-                    }
                     HideFocusParkingWindow();
                 }
                 return;
@@ -1413,7 +1415,6 @@ namespace FluentOsdPro
                     IsWindow(hwnd) && IsWindowVisible(hwnd) && !IsWindowCloaked(hwnd))
                 {
                     RemoveCloakedTargetWindow(hwnd);
-                    RestoreForegroundWindow(hwnd, "WinEvent_TargetUncloaked");
                     HideFocusParkingWindow();
                     ReinstallKeyboardHookToTop("WinEvent_TargetUncloaked");
                     ScheduleDelayedRehooks();
@@ -1477,7 +1478,8 @@ namespace FluentOsdPro
         {
             bool shouldBeActive = _isGuardEnabled ||
                                   AppSettings.Current.CapsLockFlyoutEnabled ||
-                                  AppSettings.Current.ImeFlyoutEnabled;
+                                  AppSettings.Current.ImeFlyoutEnabled ||
+                                  AppSettings.Current.BoundaryFeedbackStyle != DesktopBoundaryFeedbackStyle.None;
             if (!shouldBeActive)
             {
                 UninstallKeyboardHook(reason);
@@ -1710,10 +1712,6 @@ namespace FluentOsdPro
                                 SendMessageTimeout(hwnd, WM_NCACTIVATE, (IntPtr)1, IntPtr.Zero, SMTO_ABORTIFHUNG, 50, out res);
                                 SendMessageTimeout(hwnd, WM_ACTIVATE, (IntPtr)1, IntPtr.Zero, SMTO_ABORTIFHUNG, 50, out res);
                                 bool cloaked = IsWindowCloaked(hwnd);
-                                if (cloaked)
-                                {
-                                    AddCloakedTargetWindow(hwnd);
-                                }
                                 LogInfo("Healed " + targetName + " window activation state on startup (HWND=" + hwnd + ", Cloaked=" + cloaked + ").");
                             }
                         }
@@ -1722,7 +1720,7 @@ namespace FluentOsdPro
 
                 EnumWindows(delegate(IntPtr hWnd, IntPtr lParam)
                 {
-                    if (IsValidExternalWindow(hWnd) && !IsIconic(hWnd) && !IsWindowCloaked(hWnd) && !IsRemoteDesktopOrVdiWindow(hWnd))
+                    if (hWnd != IntPtr.Zero && IsWindow(hWnd))
                     {
                         EnsureTaskbarHoverWakeupForWindow(hWnd, "StartupSweep");
                     }
@@ -1934,7 +1932,7 @@ namespace FluentOsdPro
                         }
                     }
 
-                    // 2. Intercept Win + Ctrl + Left/Right Arrow -> Switch Local Virtual Desktop when UU or ZTE VDI is active
+                    // 2. Intercept Win + Ctrl + Left/Right Arrow -> Boundary Bounce & Switch Local Virtual Desktop
                     if (vkCode == VK_LEFT || vkCode == VK_RIGHT)
                     {
                         bool winHeld = _physWinDown || IsKeyPhysicallyDown(VK_LWIN) || IsKeyPhysicallyDown(VK_RWIN);
@@ -1942,13 +1940,41 @@ namespace FluentOsdPro
 
                         if (winHeld && ctrlHeld)
                         {
+                            bool goingLeft = vkCode == VK_LEFT;
+                            DesktopBoundaryFeedbackStyle boundaryStyle = AppSettings.Current.BoundaryFeedbackStyle;
+                            bool atBoundary = false;
+
+                            if (isDown)
+                            {
+                                atBoundary = DesktopBoundaryBounceService.IsAtVirtualDesktopBoundary(
+                                    goingLeft,
+                                    out int curDesktopIdx,
+                                    out int totalDesktops);
+
+                                if (atBoundary && boundaryStyle != DesktopBoundaryFeedbackStyle.None)
+                                {
+                                    DesktopBoundaryBounceService.Trigger(goingLeft, boundaryStyle);
+                                    LogInfo("Virtual desktop boundary reached (" +
+                                            (goingLeft ? "Left/First" : "Right/Last") +
+                                            ", Desktop " + (curDesktopIdx + 1) + "/" + totalDesktops +
+                                            ") -> triggered " + boundaryStyle + ".");
+                                }
+                            }
+
                             IntPtr currentFg = GetForegroundWindow();
-                            bool targetActive = (currentFg != IntPtr.Zero && IsWindowTargetProcess(currentFg)) || _inDesktopSwitchSession;
+                            bool targetActive = (currentFg != IntPtr.Zero && IsWindowTargetProcess(currentFg) && IsWindowMaximizedOrCoveringMonitor(currentFg)) || _inDesktopSwitchSession;
 
                             if (targetActive)
                             {
                                 if (isDown)
                                 {
+                                    // If already at the first/last virtual desktop and not mid-switch session,
+                                    // keep focus inside the remote desktop window while showing the boundary bounce!
+                                    if (atBoundary && !_inDesktopSwitchSession)
+                                    {
+                                        return (IntPtr)1;
+                                    }
+
                                     _physWinDown = true;
                                     _physCtrlDown = true;
                                     _inDesktopSwitchSession = true;
@@ -2082,6 +2108,10 @@ namespace FluentOsdPro
                         keybd_event(arrowVk, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, OurInjectedExtraInfoU);
                         keybd_event((byte)VK_LCONTROL, 0, KEYEVENTF_KEYUP, OurInjectedExtraInfoU);
                         keybd_event((byte)VK_LWIN, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, OurInjectedExtraInfoU);
+
+                        // Immediately hide the parking toolwindow so explorer.exe never sees a WS_EX_TOOLWINDOW
+                        // holding foreground focus on the destination virtual desktop (which would unhide the taskbar).
+                        HideFocusParkingWindow();
 
                         ReinstallKeyboardHookToTop("PostDesktopSwitchInject");
                         ScheduleDelayedRehooks();

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.InteropServices;
@@ -35,6 +35,14 @@ namespace FluentOsdPro
         }
 
         private const int WmMouseActivate = 0x0021;
+        private const int WmEraseBkgnd = 0x0014;
+        private const int WmDisplayChange = 0x007E;
+        private const int WmPowerBroadcast = 0x0218;
+        private const int WmSettingChange = 0x001A;
+        private const int WmThemeChanged = 0x031A;
+        private const int WmDwmCompositionChanged = 0x031E;
+        private const int WmDwmColorizationColorChanged = 0x0320;
+        private const int GclpHbrBackground = -10;
         private const int MaNoActivate = 3;
         private const int SwHide = 0;
         private const int SwShowNoActivate = 4;
@@ -70,6 +78,42 @@ namespace FluentOsdPro
 
         [DllImport("user32.dll")]
         private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll", EntryPoint = "SetClassLongPtrW", SetLastError = true)]
+        private static extern IntPtr SetClassLongPtr64(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
+
+        [DllImport("user32.dll", EntryPoint = "SetClassLongW", SetLastError = true)]
+        private static extern uint SetClassLong32(IntPtr hWnd, int nIndex, uint dwNewLong);
+
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmFlush();
+
+        private static void ClearWindowClassBackgroundBrush(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero)
+            {
+                return;
+            }
+
+            try
+            {
+                if (IntPtr.Size == 8)
+                {
+                    SetClassLongPtr64(hwnd, GclpHbrBackground, IntPtr.Zero);
+                }
+                else
+                {
+                    SetClassLong32(hwnd, GclpHbrBackground, 0);
+                }
+            }
+            catch
+            {
+            }
+        }
 
         [DllImport("winmm.dll")]
         private static extern uint timeBeginPeriod(uint uPeriod);
@@ -128,10 +172,49 @@ namespace FluentOsdPro
 
         private TextBlock _titleText;
         private TranslateTransform _titleMotion;
+        private static StatusOsdWindow _activeInstance;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct Win32BoundsRect
+        {
+            public int Left;
+            public int Top;
+            public int Right;
+            public int Bottom;
+        }
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetWindowRect(IntPtr hWnd, out Win32BoundsRect lpRect);
+
+        public static bool TryGetVisibleScreenBounds(out int left, out int top, out int right, out int bottom)
+        {
+            left = 0;
+            top = 0;
+            right = 0;
+            bottom = 0;
+            StatusOsdWindow inst = _activeInstance;
+            if (inst == null || !inst.IsCurrentlyVisible || inst._hwnd == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            if (GetWindowRect(inst._hwnd, out Win32BoundsRect rc) && rc.Right > rc.Left && rc.Bottom > rc.Top)
+            {
+                left = rc.Left;
+                top = rc.Top;
+                right = rc.Right;
+                bottom = rc.Bottom;
+                return true;
+            }
+
+            return false;
+        }
 
         public StatusOsdWindow()
         {
-            Title = "UULocalVolumeGuard_StatusOSD";
+            _activeInstance = this;
+            Title = "FluentOsdPro_StatusOSD";
             WindowStyle = WindowStyle.None;
             ResizeMode = ResizeMode.NoResize;
             Background = Brushes.Transparent;
@@ -303,6 +386,7 @@ namespace FluentOsdPro
         {
             base.OnSourceInitialized(e);
             _hwnd = new WindowInteropHelper(this).Handle;
+            ClearWindowClassBackgroundBrush(_hwnd);
 
             _hwndSource = HwndSource.FromHwnd(_hwnd);
             if (_hwndSource?.CompositionTarget != null)
@@ -311,7 +395,7 @@ namespace FluentOsdPro
             }
             _hwndSource?.AddHook(WindowMessageHook);
 
-            ApplyCurrentTheme();
+            ApplyCurrentTheme(force: true);
         }
 
         private IntPtr WindowMessageHook(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
@@ -321,6 +405,32 @@ namespace FluentOsdPro
                 handled = true;
                 return new IntPtr(MaNoActivate);
             }
+
+            if (msg == WmEraseBkgnd)
+            {
+                handled = true;
+                return new IntPtr(1);
+            }
+
+            if (msg == WmDisplayChange ||
+                msg == WmPowerBroadcast ||
+                msg == WmSettingChange ||
+                msg == WmThemeChanged ||
+                msg == WmDwmCompositionChanged ||
+                msg == WmDwmColorizationColorChanged)
+            {
+                _lastAppliedDark = null;
+                _lastAppliedAcrylic = null;
+                Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    if (_hwnd != IntPtr.Zero)
+                    {
+                        ApplyCurrentTheme(force: true);
+                        InvalidateVisual();
+                    }
+                }), DispatcherPriority.Send);
+            }
+
             return IntPtr.Zero;
         }
 
@@ -489,7 +599,7 @@ namespace FluentOsdPro
             _lastTitleText = title;
             _lastDetailText = string.Empty;
 
-            ApplyCurrentTheme();
+            ApplyCurrentTheme(force: !wasVisible);
             UpdateFlyoutWidth(title, fixedWidthReference);
 
             Rect? stackAboveVolume = null;
@@ -539,7 +649,7 @@ namespace FluentOsdPro
             }
         }
 
-        private void ApplyCurrentTheme()
+        private void ApplyCurrentTheme(bool force = false)
         {
             bool isDark = ThemeService.IsSystemDarkTheme();
             bool isLight = !isDark;
@@ -571,7 +681,8 @@ namespace FluentOsdPro
                 : CreateFrozenBrush(isLight ? Color.FromRgb(0xFF, 0xFF, 0xFF) : Color.FromRgb(0x16, 0x17, 0x1A));
 
             if (_hwnd != IntPtr.Zero &&
-                (!_lastAppliedDark.HasValue || _lastAppliedDark.Value != isDark ||
+                (force ||
+                 !_lastAppliedDark.HasValue || _lastAppliedDark.Value != isDark ||
                  !_lastAppliedAcrylic.HasValue || _lastAppliedAcrylic.Value != enableAcrylic))
             {
                 _lastAppliedDark = isDark;
@@ -1228,9 +1339,28 @@ namespace FluentOsdPro
 
             if (ensureShown)
             {
+                bool wasHwndVisible = IsWindowVisible(_hwnd);
+                if (!wasHwndVisible)
+                {
+                    SetWindowPos(_hwnd, HwndTopMost, -32000, -32000, wPx, hPx, SwpNoActivate | SwpNoOwnerZOrder | SwpNoSendChanging);
+                    ShowWindow(_hwnd, SwShowNoActivate);
+                    ApplyCurrentTheme(force: true);
+                    InvalidateVisual();
+                    UpdateLayout();
+                    try
+                    {
+                        DwmFlush();
+                    }
+                    catch
+                    {
+                    }
+                }
+                else
+                {
+                    UpdateLayout();
+                }
+
                 SetWindowPos(_hwnd, HwndTopMost, xPx, yPx, wPx, hPx, SwpNoActivate | SwpNoOwnerZOrder);
-                UpdateLayout();
-                ShowWindow(_hwnd, SwShowNoActivate);
             }
             else
             {

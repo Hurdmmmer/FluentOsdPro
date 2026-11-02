@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -75,6 +75,25 @@ namespace FluentOsdPro
         private static int _lastMyGoCursorYPx;
         private static int _lastMyGoCursorHeightPx;
         private static readonly object _caretCacheLock = new object();
+
+        private sealed class MyGoBlinkFrame
+        {
+            public IntPtr FgHwnd;
+            public int ScanLeft;
+            public int ScanTop;
+            public int ScanW;
+            public int ScanH;
+            public int BgR;
+            public int BgG;
+            public int BgB;
+            public int Tick;
+            public int[] Pixels;
+        }
+
+        private static readonly object _myGoBlinkLock = new object();
+        private static readonly MyGoBlinkFrame[] _myGoBlinkRing = new MyGoBlinkFrame[3];
+        private static int _myGoBlinkRingWriteIndex;
+        private static int _myGoBlinkSamplingActive;
 
         private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
@@ -179,6 +198,9 @@ namespace FluentOsdPro
 
         [DllImport("user32.dll")]
         private static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        private static extern uint GetCaretBlinkTime();
 
         [DllImport("user32.dll")]
         private static extern bool GetCursorPos(out Win32Point lpPoint);
@@ -584,9 +606,89 @@ namespace FluentOsdPro
                 try
                 {
                     WarmUpWindowTreeSync(fg);
+                    ScheduleMyGoBlinkSamplesIfNeeded(fg);
                 }
                 catch
                 {
+                }
+            });
+        }
+
+        private static void ScheduleMyGoBlinkSamplesIfNeeded(IntPtr fg)
+        {
+            if (fg == IntPtr.Zero)
+            {
+                return;
+            }
+
+            string cls = GetWindowClassNameSafe(fg);
+            if (cls.IndexOf("MyGo", StringComparison.OrdinalIgnoreCase) < 0)
+            {
+                return;
+            }
+
+            if (System.Threading.Interlocked.CompareExchange(ref _myGoBlinkSamplingActive, 1, 0) != 0)
+            {
+                return;
+            }
+
+            Task.Run(async () =>
+            {
+                try
+                {
+                    uint sysBlink = GetCaretBlinkTime();
+                    int baseHalfCycleMs = (sysBlink >= 180 && sysBlink <= 1200) ? (int)sysBlink : 500;
+                    int delay1 = Math.Max(180, (baseHalfCycleMs * 48) / 100); // ~240ms
+                    int delay2 = Math.Max(240, (baseHalfCycleMs * 62) / 100); // +~310ms (total ~550ms)
+
+                    TryComputeTextCaretPhysicalPoint(fg, out _, out _, out _, out _);
+
+                    await Task.Delay(delay1).ConfigureAwait(false);
+                    if (GetForegroundWindow() != fg)
+                    {
+                        return;
+                    }
+                    if (TryComputeTextCaretPhysicalPoint(fg, out int cx1, out int cy1, out int ch1, out string st1) &&
+                        string.Equals(st1, "MyGoTemporalBlinkCursor", StringComparison.Ordinal))
+                    {
+                        lock (_caretCacheLock)
+                        {
+                            _lastCaretLookupFg = fg;
+                            _lastCaretLookupTick = Environment.TickCount & int.MaxValue;
+                            _lastCaretLookupSuccess = true;
+                            _lastCaretXPx = cx1;
+                            _lastCaretYPx = cy1;
+                            _lastCaretHeightPx = ch1;
+                            _lastCaretStrategy = st1;
+                        }
+                        return;
+                    }
+
+                    await Task.Delay(delay2).ConfigureAwait(false);
+                    if (GetForegroundWindow() != fg)
+                    {
+                        return;
+                    }
+                    if (TryComputeTextCaretPhysicalPoint(fg, out int cx2, out int cy2, out int ch2, out string st2))
+                    {
+                        lock (_caretCacheLock)
+                        {
+                            _lastCaretLookupFg = fg;
+                            _lastCaretLookupTick = Environment.TickCount & int.MaxValue;
+                            _lastCaretLookupSuccess = true;
+                            _lastCaretXPx = cx2;
+                            _lastCaretYPx = cy2;
+                            _lastCaretHeightPx = ch2;
+                            _lastCaretStrategy = st2;
+                        }
+                    }
+                }
+                catch
+                {
+                }
+                finally
+                {
+                    System.Threading.Interlocked.Exchange(ref _myGoBlinkSamplingActive, 0);
                 }
             });
         }
@@ -625,6 +727,7 @@ namespace FluentOsdPro
                             _lastCaretStrategy = strategy;
                         }
                     }
+                    ScheduleMyGoBlinkSamplesIfNeeded(fg);
                 }
                 catch
                 {
@@ -1572,7 +1675,8 @@ namespace FluentOsdPro
 
                 // 5) Kero / MyGoSurface terminal & chat workspace pane (ct=50026 Group):
                 //    In Kero (built on github.com/egoist/mygo), the right-hand workspace pane is a single GPU-rendered
-                //    UIA Group (ct=50026). Locate the live terminal block cursor `█` (or `>` prompt line) directly!
+                //    UIA Group (ct=50026). Locate the live terminal block cursor `█`, `>` chat prompt box, or
+                //    active terminal command line (e.g. `jimmy@windows:SSYW>`) across the full workspace pane!
                 if (isSubtreeChild && isMyGoSurface && controlTypeId == 50026)
                 {
                     double fgW = Math.Max(1.0, fgRect.Right - fgRect.Left);
@@ -1585,17 +1689,6 @@ namespace FluentOsdPro
                         {
                             return true;
                         }
-
-                        int cx = (int)Math.Round(elemRect.Left + Math.Max(32.0, Math.Min(64.0, elemRect.Width * 0.020)));
-                        int cy = (int)Math.Round(elemRect.Bottom - Math.Max(190.0, Math.Min(255.0, elemRect.Height * 0.100)));
-                        if (IsReasonableCaretPoint(cx, cy, ref fgRect))
-                        {
-                            xPx = cx;
-                            yPx = cy;
-                            heightPx = 36;
-                            strategy = "MyGoWorkspaceInputBox";
-                            return true;
-                        }
                     }
                 }
             }
@@ -1604,11 +1697,15 @@ namespace FluentOsdPro
         }
 
         /// <summary>
-        /// Locates the active terminal block cursor inside Kero's GPU-rendered MyGoSurface workspace pane
-        /// in ~1.0ms using a top-down 32bpp DIB section.
-        /// Strictly constrains detection to the bottom prompt input box (below the top horizontal divider line
-        /// and aligned with the `>` prompt chevron) so chat history above the input box is never matched,
-        /// and compensates for the 500ms cursor blink-off phase by tracking the input line's rightmost glyph.
+        /// Locates the active terminal block cursor or active prompt line inside Kero's GPU-rendered
+        /// MyGoSurface workspace pane using a top-down 32bpp DIB section across the full pane height.
+        /// Supports two distinct workspace modes:
+        ///   - Mode A (AI Chat Box with blue `>` chevron and horizontal divider lines, at any vertical height):
+        ///     Strictly constrains detection to `[boxTopY .. boxBottomY]` so upper chat history is never matched.
+        ///   - Mode B (Standard Terminal / SSH / PowerShell Tab, e.g. `jimmy@windows:SSYW>` at the top of a new tab):
+        ///     Scans from the bottom of the terminal canvas upward to locate the lowest active terminal text line,
+        ///     matching either its terminal block cursor or the rightmost glyph at the end of that prompt line.
+        /// Also masks out our own StatusOsdWindow if currently visible so rapid Shift toggles never self-detect.
         /// </summary>
         private static bool TryFindMyGoTerminalCursorRect(
             Rect elemRect,
@@ -1634,20 +1731,30 @@ namespace FluentOsdPro
                 return false;
             }
 
-            // Only capture the bottom 360px strip of the workspace pane where the prompt input box lives.
-            // This physically excludes the upper and middle chat history area.
-            int scanMarginX = Math.Min(24, paneW / 20);
+            // Capture the full vertical height of the workspace pane (from top tab bar margin down to bottom margin)
+            // so newly opened terminal/SSH tabs (where `jimmy@windows:SSYW>` is near the top) are detected accurately.
+            int scanMarginX = Math.Min(24, paneW / 24);
             int scanLeft = paneLeft + scanMarginX;
-            int scanRight = paneRight - scanMarginX;
+            int scanRight = paneRight - Math.Max(scanMarginX, 24); // Exclude right-edge scrollbar track
             int scanW = scanRight - scanLeft;
-            int scanH = Math.Min(360, Math.Max(200, (int)Math.Round(paneH * 0.18)));
+            int scanTop = paneTop + 16;
             int scanBottom = paneBottom - 16;
-            int scanTop = Math.Max(paneTop + 16, scanBottom - scanH);
-            scanH = scanBottom - scanTop;
+            int scanH = scanBottom - scanTop;
 
             if (scanW <= 64 || scanH <= 48)
             {
                 return false;
+            }
+
+            // If our own StatusOsdWindow is currently visible on screen, compute its scan-local bounding box
+            // (expanded by 18px for shadow/border) so we never mistake our own OSD capsule for terminal text!
+            int maskLeft = -1, maskTop = -1, maskRight = -1, maskBottom = -1;
+            if (StatusOsdWindow.TryGetVisibleScreenBounds(out int osdL, out int osdT, out int osdR, out int osdB))
+            {
+                maskLeft = Math.Max(0, osdL - scanLeft - 18);
+                maskTop = Math.Max(0, osdT - scanTop - 18);
+                maskRight = Math.Min(scanW - 1, osdR - scanLeft + 18);
+                maskBottom = Math.Min(scanH - 1, osdB - scanTop + 18);
             }
 
             IntPtr screenDc = IntPtr.Zero;
@@ -1694,224 +1801,240 @@ namespace FluentOsdPro
                 int[] pixels = new int[totalPixels];
                 Marshal.Copy(pBits, pixels, 0, totalPixels);
 
-                // Step 1: Locate the blue `>` prompt chevron near the left margin (x = 8..115) from bottom to top.
-                // In Kero, the active input box ALWAYS starts with `>` (RGB ~ 33, 131, 193).
-                int promptFoundX = -1;
-                int promptFoundY = -1;
-                int promptMaxX = Math.Min(scanW - 8, 120);
-                for (int y = scanH - 12; y >= 12; y -= 2)
+                // Sample background RGB from multiple vertical positions along the quiet left margin (x = 4)
+                // and pick the darkest background sample so text on a single row never skews bgR/bgG/bgB.
+                int bgR = 24, bgG = 28, bgB = 24;
+                int bestBgLum = int.MaxValue;
+                int[] bgSampleYs = new int[]
                 {
-                    int rowOffset = y * scanW;
-                    for (int x = 8; x < promptMaxX; x += 2)
+                    Math.Max(4, scanH - 20),
+                    (scanH * 3) / 4,
+                    scanH / 2,
+                    scanH / 4,
+                    Math.Min(scanH - 4, 24)
+                };
+                for (int i = 0; i < bgSampleYs.Length; i++)
+                {
+                    int sy = bgSampleYs[i];
+                    if (sy >= maskTop && sy <= maskBottom && 4 >= maskLeft && 4 <= maskRight)
                     {
-                        int c = pixels[rowOffset + x];
-                        int r = (c >> 16) & 0xFF;
-                        int g = (c >> 8) & 0xFF;
-                        int b = c & 0xFF;
-                        if (r >= 15 && r <= 60 && g >= 105 && g <= 160 && b >= 165 && b <= 225 && b > g + 25)
-                        {
-                            promptFoundX = x;
-                            promptFoundY = y;
-                            break;
-                        }
+                        continue;
                     }
-                    if (promptFoundY >= 0)
+                    int sc = pixels[sy * scanW + 4];
+                    int sr = (sc >> 16) & 0xFF;
+                    int sg = (sc >> 8) & 0xFF;
+                    int sb = sc & 0xFF;
+                    int lum = sr + sg + sb;
+                    if (lum < bestBgLum)
                     {
-                        break;
+                        bestBgLum = lum;
+                        bgR = sr;
+                        bgG = sg;
+                        bgB = sb;
                     }
                 }
 
-                // Determine the exact vertical bounds [boxTopY .. boxBottomY] of the prompt input box
-                // by finding the full-width horizontal divider lines (`────────`) above and below `>`.
-                int bgSample = pixels[(promptFoundY >= 0 ? promptFoundY : scanH / 2) * scanW + 4];
-                int bgR = (bgSample >> 16) & 0xFF;
-                int bgG = (bgSample >> 8) & 0xFF;
-                int bgB = bgSample & 0xFF;
-
-                int boxTopY = 8;
-                int boxBottomY = scanH - 8;
-                int promptRightX = 56;
-                int promptTopY = scanH - 80;
-
-                if (promptFoundY >= 0)
+                // Mask out our own visible StatusOsdWindow pixels by filling them with the background color
+                if (maskLeft <= maskRight && maskTop <= maskBottom && maskRight >= 0 && maskBottom >= 0)
                 {
-                    promptRightX = promptFoundX;
-                    int pMinY = promptFoundY;
-                    int pMaxY = promptFoundY;
-                    for (int py = Math.Max(4, promptFoundY - 20); py <= Math.Min(scanH - 4, promptFoundY + 20); py++)
+                    int bgPacked = (bgR << 16) | (bgG << 8) | bgB;
+                    for (int my = maskTop; my <= maskBottom; my++)
                     {
-                        int rOff = py * scanW;
-                        for (int px = Math.Max(4, promptFoundX - 16); px <= Math.Min(promptMaxX, promptFoundX + 24); px++)
+                        int rOff = my * scanW;
+                        for (int mx = maskLeft; mx <= maskRight; mx++)
                         {
-                            int c = rOff + px;
-                            int pr = (pixels[c] >> 16) & 0xFF;
-                            int pg = (pixels[c] >> 8) & 0xFF;
-                            int pb = pixels[c] & 0xFF;
-                            if (pr >= 15 && pr <= 60 && pg >= 105 && pg <= 160 && pb >= 165 && pb <= 225 && pb > pg + 25)
+                            pixels[rOff + mx] = bgPacked;
+                        }
+                    }
+                }
+
+                // =========================================================================================
+                // MODE A: Check for AI Chat Input Box (Antigravity CLI / Claude Code CLI / Kero TUI)
+                // Step 1: Locate the pair of horizontal divider lines (`topDiv` and `botDiv`) in the bottom
+                // region of the pane (within 420px of bottom, never up in the chat history at Y=3342/3644!).
+                // =========================================================================================
+                int aiSearchTopY = Math.Max(12, scanH - 420);
+                int foundBotDiv = -1;
+                int foundTopDiv = -1;
+                int lastDivY = -999;
+
+                for (int y = scanH - 6; y >= aiSearchTopY; y--)
+                {
+                    if (IsHorizontalDividerRow(pixels, scanW, y, bgR, bgG, bgB))
+                    {
+                        if (lastDivY > 0 && Math.Abs(lastDivY - y) <= 6)
+                        {
+                            if (foundTopDiv == lastDivY)
                             {
-                                if (px > promptRightX) promptRightX = px;
-                                if (py < pMinY) pMinY = py;
-                                if (py > pMaxY) pMaxY = py;
+                                foundTopDiv = y;
                             }
+                            lastDivY = y;
+                            continue;
                         }
-                    }
 
-                    promptTopY = Math.Max(4, pMinY - 14);
-
-                    // Search upward from pMinY for the top horizontal divider line (`────────`) of the input box
-                    int topDiv = -1;
-                    for (int y = pMinY - 4; y >= 4; y--)
-                    {
-                        if (IsHorizontalDividerRow(pixels, scanW, y, bgR, bgG, bgB))
+                        lastDivY = y;
+                        if (foundBotDiv < 0)
                         {
-                            topDiv = y;
-                            break;
+                            foundBotDiv = y;
                         }
-                    }
-
-                    // Search downward from pMaxY for the bottom horizontal divider line (`────────`) of the input box
-                    int botDiv = -1;
-                    for (int y = pMaxY + 4; y < scanH - 4; y++)
-                    {
-                        if (IsHorizontalDividerRow(pixels, scanW, y, bgR, bgG, bgB))
+                        else
                         {
-                            botDiv = y;
-                            break;
-                        }
-                    }
-
-                    boxTopY = topDiv >= 0 ? Math.Max(4, topDiv + 3) : Math.Max(4, promptTopY - 8);
-                    boxBottomY = botDiv >= 0 ? Math.Min(scanH - 4, botDiv - 3) : Math.Min(scanH - 4, pMaxY + 36);
-                }
-                else
-                {
-                    // If `>` was not found, still locate the bottom two horizontal divider lines
-                    int botDiv = -1;
-                    int topDiv = -1;
-                    for (int y = scanH - 8; y >= 8; y--)
-                    {
-                        if (IsHorizontalDividerRow(pixels, scanW, y, bgR, bgG, bgB))
-                        {
-                            if (botDiv < 0)
+                            int gap = foundBotDiv - y;
+                            if (gap >= 28 && gap <= 260)
                             {
-                                botDiv = y;
-                                y -= 24; // Skip past the bottom divider thickness and minimum input row height
+                                foundTopDiv = y;
+                                break;
                             }
                             else
                             {
-                                topDiv = y;
-                                break;
+                                foundBotDiv = y;
                             }
                         }
                     }
+                }
 
-                    if (topDiv >= 0 && botDiv > topDiv + 20)
+                bool isAiChatInputBox = false;
+                int boxTopY = 8;
+                int boxBottomY = scanH - 8;
+                int promptRightX = 36;
+                int promptTopY = scanH - 80;
+
+                if (foundTopDiv >= 0 && foundBotDiv > foundTopDiv)
+                {
+                    isAiChatInputBox = true;
+                    boxTopY = Math.Max(4, foundTopDiv + 3);
+                    boxBottomY = Math.Min(scanH - 4, foundBotDiv - 3);
+                    promptTopY = Math.Max(boxTopY + 4, boxBottomY - 56);
+
+                    // Find the leftmost prompt chevron (`>` or `❯`, any color) near the left margin (x in 8..110),
+                    // stopping at the first vertical background gap so we never swallow an adjacent block cursor `█`!
+                    int promptMaxX = Math.Min(scanW - 8, 110);
+                    int chevronStartX = -1;
+                    int chevronEndX = -1;
+                    int chevronMinY = boxBottomY;
+                    for (int x = 8; x <= promptMaxX; x++)
                     {
-                        boxTopY = topDiv + 3;
-                        boxBottomY = botDiv - 3;
-                        promptTopY = boxTopY + 10;
+                        int colFg = 0;
+                        int colMinY = boxBottomY;
+                        for (int y = boxTopY + 2; y <= boxBottomY - 2; y++)
+                        {
+                            int c = pixels[y * scanW + x];
+                            int r = (c >> 16) & 0xFF;
+                            int g = (c >> 8) & 0xFF;
+                            int b = c & 0xFF;
+                            if (Math.Abs(r - bgR) + Math.Abs(g - bgG) + Math.Abs(b - bgB) >= 85)
+                            {
+                                colFg++;
+                                if (y < colMinY) colMinY = y;
+                            }
+                        }
+
+                        if (colFg > 0)
+                        {
+                            if (chevronStartX < 0)
+                            {
+                                chevronStartX = x;
+                            }
+                            chevronEndX = x;
+                            if (colMinY < chevronMinY) chevronMinY = colMinY;
+
+                            if (chevronEndX - chevronStartX >= 22)
+                            {
+                                break;
+                            }
+                        }
+                        else if (chevronStartX >= 0 && x - chevronEndX >= 2)
+                        {
+                            break;
+                        }
                     }
-                    else
+
+                    if (chevronEndX > 0)
                     {
-                        // Strict bottom-only fallback band (never scanning upper chat history)
-                        boxTopY = Math.Max(8, scanH - 180);
-                        boxBottomY = scanH - 24;
-                        promptTopY = boxTopY + 16;
+                        promptRightX = chevronEndX;
+                        promptTopY = Math.Max(boxTopY + 2, chevronMinY - 10);
                     }
                 }
 
-                // Step 2 (Blink-ON): Search STRICTLY inside [boxTopY .. boxBottomY] for Kero's solid teal cursor block
-                // Real Kero cursor RGB is (0, 132, 146) -> R <= 18, G 115..158, B 125..166, and |B - G| <= 24.
-                // (This also rejects sky-blue inline code text RGB(22, 124, 186) where B - G = 62.)
-                int searchStartX = Math.Max(16, promptRightX + 2);
-                for (int y = boxBottomY - 4; y >= boxTopY + 4; y -= 3)
+                if (isAiChatInputBox)
                 {
-                    int rowOffset = y * scanW;
-                    for (int x = searchStartX; x < scanW - 16; x += 3)
-                    {
-                        int c = pixels[rowOffset + x];
-                        int r = (c >> 16) & 0xFF;
-                        int g = (c >> 8) & 0xFF;
-                        int b = c & 0xFF;
+                    IntPtr fgNow = GetForegroundWindow();
+                    int nowTick = Environment.TickCount;
 
-                        if (r <= 18 && g >= 115 && g <= 158 && b >= 125 && b <= 166 && Math.Abs(b - g) <= 24)
+                    // Mode A Priority 1 (Temporal Blink Diff across 3-frame ring buffer):
+                    if (TryFindTemporalBlinkCursorInBand(
+                        fgNow, pixels, scanLeft, scanTop, scanW, scanH,
+                        Math.Max(8, promptRightX), scanW - 12, boxTopY, boxBottomY,
+                        bgR, bgG, bgB, nowTick, ref fgRect,
+                        out xPx, out yPx, out heightPx))
+                    {
+                        strategy = "MyGoTemporalBlinkCursor";
+                        _lastMyGoCursorFg = fgNow;
+                        _lastMyGoCursorTick = nowTick;
+                        _lastMyGoCursorXPx = xPx;
+                        _lastMyGoCursorYPx = yPx;
+                        _lastMyGoCursorHeightPx = heightPx;
+                        PushMyGoBlinkFrame(fgNow, scanLeft, scanTop, scanW, scanH, bgR, bgG, bgB, nowTick, pixels);
+                        return true;
+                    }
+
+                    // Mode A Priority 2 (Color-Agnostic Solid / Inverted Cursor Block `█` in [boxTopY .. boxBottomY]):
+                    // Handles steady black block cursors (`❯ █`), colored blocks, AND double-width CJK cursor blocks
+                    // with inverted white Chinese characters inside!
+                    int searchStartX = Math.Max(16, promptRightX + 2);
+                    for (int y = boxBottomY - 4; y >= boxTopY + 4; y -= 3)
+                    {
+                        int rowOffset = y * scanW;
+                        for (int x = scanW - 16; x >= searchStartX; x -= 3)
                         {
-                            if (TryMeasureUniformCursorBlock(
-                                pixels, scanW, scanH, x, y, r, g, b,
-                                out int blockLeft, out int blockRight, out int blockTop, out int blockBottom) &&
-                                blockTop >= boxTopY - 2 && blockBottom <= boxBottomY + 2)
+                            int c = pixels[rowOffset + x];
+                            int r = (c >> 16) & 0xFF;
+                            int g = (c >> 8) & 0xFF;
+                            int b = c & 0xFF;
+
+                            int bgDiff = Math.Abs(r - bgR) + Math.Abs(g - bgG) + Math.Abs(b - bgB);
+                            if (bgDiff >= 90)
                             {
-                                int screenX = scanLeft + blockRight;
-                                int screenY = scanTop + blockTop;
-                                int blockH = blockBottom - blockTop + 1;
-                                if (IsReasonableCaretPoint(screenX, screenY, ref fgRect))
+                                if (TryMeasureColorAgnosticCursorBlock(
+                                    pixels, scanW, scanH, x, y, r, g, b, bgR, bgG, bgB,
+                                    out int blockLeft, out int blockRight, out int blockTop, out int blockBottom) &&
+                                    blockTop >= boxTopY - 2 && blockBottom <= boxBottomY + 2)
                                 {
-                                    xPx = screenX;
-                                    yPx = screenY;
-                                    heightPx = blockH;
-                                    strategy = "MyGoTerminalCursor";
-                                    IntPtr fgNow = GetForegroundWindow();
-                                    _lastMyGoCursorFg = fgNow;
-                                    _lastMyGoCursorTick = Environment.TickCount;
-                                    _lastMyGoCursorXPx = xPx;
-                                    _lastMyGoCursorYPx = yPx;
-                                    _lastMyGoCursorHeightPx = heightPx;
-                                    return true;
+                                    int screenX = scanLeft + blockRight;
+                                    int screenY = scanTop + blockTop;
+                                    int blockH = blockBottom - blockTop + 1;
+                                    if (IsReasonableCaretPoint(screenX, screenY, ref fgRect))
+                                    {
+                                        xPx = screenX;
+                                        yPx = screenY;
+                                        heightPx = blockH;
+                                        strategy = "MyGoColorAgnosticCursorBlock";
+                                        _lastMyGoCursorFg = fgNow;
+                                        _lastMyGoCursorTick = nowTick;
+                                        _lastMyGoCursorXPx = xPx;
+                                        _lastMyGoCursorYPx = yPx;
+                                        _lastMyGoCursorHeightPx = heightPx;
+                                        PushMyGoBlinkFrame(fgNow, scanLeft, scanTop, scanW, scanH, bgR, bgG, bgB, nowTick, pixels);
+                                        return true;
+                                    }
                                 }
                             }
                         }
                     }
-                }
 
-                // Step 3 (Blink-OFF Compensation):
-                // When the user presses Shift during the 500ms half-cycle when the cursor block is blinked OFF,
-                // scan the input box [boxTopY .. boxBottomY] from right to left to find the rightmost typed character pixel!
-                int rightmostTextX = -1;
-                int rightmostTextY = promptTopY;
-                int textScanTop = Math.Max(boxTopY + 4, promptTopY);
-                int textScanBottom = Math.Min(boxBottomY - 4, promptTopY + 52);
+                    PushMyGoBlinkFrame(fgNow, scanLeft, scanTop, scanW, scanH, bgR, bgG, bgB, nowTick, pixels);
 
-                for (int x = scanW - 24; x > promptRightX + 8; x -= 2)
-                {
-                    int fgPixelCount = 0;
-                    for (int y = textScanTop; y <= textScanBottom; y += 2)
-                    {
-                        int c = pixels[y * scanW + x];
-                        int r = (c >> 16) & 0xFF;
-                        int g = (c >> 8) & 0xFF;
-                        int b = c & 0xFF;
-                        int diff = Math.Abs(r - bgR) + Math.Abs(g - bgG) + Math.Abs(b - bgB);
-                        if (diff >= 65)
-                        {
-                            fgPixelCount++;
-                            if (fgPixelCount >= 2)
-                            {
-                                rightmostTextX = x;
-                                break;
-                            }
-                        }
-                    }
-                    if (rightmostTextX >= 0)
-                    {
-                        break;
-                    }
-                }
-
-                IntPtr currentFg = GetForegroundWindow();
-                long ageMs = unchecked((uint)(Environment.TickCount - _lastMyGoCursorTick));
-                int expectedScreenLineY = scanTop + promptTopY;
-
-                if (rightmostTextX > promptRightX + 8)
-                {
-                    // There is text on the input line, and the cursor block is in its 500ms blink-OFF phase!
-                    int estimatedCursorRightScreenX = scanLeft + rightmostTextX + 20;
-
-                    // If our cached blink-ON cursor is on this exact input line and right next to the text end, reuse it for 0px jitter
-                    if (currentFg != IntPtr.Zero &&
-                        currentFg == _lastMyGoCursorFg &&
-                        ageMs <= 8000 &&
-                        Math.Abs(_lastMyGoCursorYPx - expectedScreenLineY) <= 28 &&
-                        Math.Abs(_lastMyGoCursorXPx - estimatedCursorRightScreenX) <= 36 &&
+                    // Mode A Priority 3 (Recent Confirmed Cursor Cache during 500ms Blink-OFF half-cycle):
+                    // Only reuse a recently confirmed real cursor block / blink cell within the input box bounds.
+                    // Never guess text line ends!
+                    long ageMs = unchecked((uint)(nowTick - _lastMyGoCursorTick));
+                    int boxScreenTop = scanTop + boxTopY - 6;
+                    int boxScreenBottom = scanTop + boxBottomY + 6;
+                    if (fgNow != IntPtr.Zero &&
+                        fgNow == _lastMyGoCursorFg &&
+                        ageMs <= 4500 &&
+                        _lastMyGoCursorYPx >= boxScreenTop &&
+                        _lastMyGoCursorYPx <= boxScreenBottom &&
                         IsReasonableCaretPoint(_lastMyGoCursorXPx, _lastMyGoCursorYPx, ref fgRect))
                     {
                         xPx = _lastMyGoCursorXPx;
@@ -1920,31 +2043,172 @@ namespace FluentOsdPro
                         strategy = "MyGoTerminalCursorBlinkCached";
                         return true;
                     }
-
-                    if (IsReasonableCaretPoint(estimatedCursorRightScreenX, expectedScreenLineY, ref fgRect))
-                    {
-                        xPx = estimatedCursorRightScreenX;
-                        yPx = expectedScreenLineY;
-                        heightPx = 47;
-                        strategy = "MyGoTerminalCursorBlinkTextEnd";
-                        return true;
-                    }
                 }
 
-                // Step 4: Input line is empty (`> ` only) and cursor is blinked off or hidden -> anchor right after `>`
-                if (promptFoundY >= 0)
+                // =========================================================================================
+                // MODE B: Standard Terminal / SSH / PowerShell Tab (e.g. `jimmy@windows:SSYW>` at top/middle)
+                // =========================================================================================
+                IntPtr termFgNow = GetForegroundWindow();
+                int termNowTick = Environment.TickCount;
+
+                // Mode B Priority 1: Check 3-frame Temporal Blink Diff across the full terminal canvas!
+                if (TryFindTemporalBlinkCursorInBand(
+                    termFgNow, pixels, scanLeft, scanTop, scanW, scanH,
+                    8, scanW - 16, 8, scanH - 8,
+                    bgR, bgG, bgB, termNowTick, ref fgRect,
+                    out xPx, out yPx, out heightPx))
                 {
-                    int emptyCursorScreenX = scanLeft + promptRightX + 24;
-                    int emptyCursorScreenY = scanTop + promptTopY;
-                    if (IsReasonableCaretPoint(emptyCursorScreenX, emptyCursorScreenY, ref fgRect))
+                    strategy = "MyGoTemporalBlinkCursor";
+                    _lastMyGoCursorFg = termFgNow;
+                    _lastMyGoCursorTick = termNowTick;
+                    _lastMyGoCursorXPx = xPx;
+                    _lastMyGoCursorYPx = yPx;
+                    _lastMyGoCursorHeightPx = heightPx;
+                    PushMyGoBlinkFrame(termFgNow, scanLeft, scanTop, scanW, scanH, bgR, bgG, bgB, termNowTick, pixels);
+                    return true;
+                }
+
+                // Mode B Priority 2: Find the lowest non-empty terminal text line (when not an AI Chat Input Box)
+                if (!isAiChatInputBox)
+                {
+                    int lowestTextRowY = -1;
+                    for (int y = scanH - 12; y >= 8; y -= 2)
                     {
-                        xPx = emptyCursorScreenX;
-                        yPx = emptyCursorScreenY;
-                        heightPx = 47;
-                        strategy = "MyGoPromptChevron";
-                        return true;
+                        if (IsHorizontalDividerRow(pixels, scanW, y, bgR, bgG, bgB))
+                        {
+                            continue;
+                        }
+
+                        int rowOffset = y * scanW;
+                        int rowFgPixels = 0;
+                        for (int x = 8; x < scanW - 24; x += 2)
+                        {
+                            int c = pixels[rowOffset + x];
+                            int r = (c >> 16) & 0xFF;
+                            int g = (c >> 8) & 0xFF;
+                            int b = c & 0xFF;
+                            if (Math.Abs(r - bgR) + Math.Abs(g - bgG) + Math.Abs(b - bgB) >= 95)
+                            {
+                                rowFgPixels++;
+                                if (rowFgPixels >= 3)
+                                {
+                                    lowestTextRowY = y;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (lowestTextRowY >= 0)
+                        {
+                            break;
+                        }
+                    }
+
+                    if (lowestTextRowY >= 0)
+                    {
+                        int lineBottomY = Math.Min(scanH - 4, lowestTextRowY + 8);
+                        int lineTopY = Math.Max(4, lowestTextRowY - 38);
+                        int blankRows = 0;
+                        for (int y = lowestTextRowY - 1; y >= Math.Max(4, lowestTextRowY - 56); y--)
+                        {
+                            int rowOffset = y * scanW;
+                            bool rowHasText = false;
+                            for (int x = 8; x < scanW - 24; x += 3)
+                            {
+                                int c = pixels[rowOffset + x];
+                                int r = (c >> 16) & 0xFF;
+                                int g = (c >> 8) & 0xFF;
+                                int b = c & 0xFF;
+                                if (Math.Abs(r - bgR) + Math.Abs(g - bgG) + Math.Abs(b - bgB) >= 95)
+                                {
+                                    rowHasText = true;
+                                    break;
+                                }
+                            }
+
+                            if (!rowHasText)
+                            {
+                                blankRows++;
+                                if (blankRows >= 5)
+                                {
+                                    lineTopY = y + blankRows;
+                                    break;
+                                }
+                            }
+                            else
+                            {
+                                blankRows = 0;
+                                lineTopY = y;
+                            }
+                        }
+
+                        // Check for a color-agnostic cursor block on this lowest active terminal line
+                        for (int y = lineBottomY; y >= lineTopY; y -= 2)
+                        {
+                            int rowOffset = y * scanW;
+                            for (int x = scanW - 16; x >= 8; x -= 3)
+                            {
+                                int c = pixels[rowOffset + x];
+                                int r = (c >> 16) & 0xFF;
+                                int g = (c >> 8) & 0xFF;
+                                int b = c & 0xFF;
+                                if (Math.Abs(r - bgR) + Math.Abs(g - bgG) + Math.Abs(b - bgB) >= 90)
+                                {
+                                    if (TryMeasureColorAgnosticCursorBlock(
+                                        pixels, scanW, scanH, x, y, r, g, b, bgR, bgG, bgB,
+                                        out int blockLeft, out int blockRight, out int blockTop, out int blockBottom) &&
+                                        blockTop >= lineTopY - 8 && blockBottom <= lineBottomY + 8)
+                                    {
+                                        int screenX = scanLeft + blockRight;
+                                        int screenY = scanTop + blockTop;
+                                        int blockH = blockBottom - blockTop + 1;
+                                        if (IsReasonableCaretPoint(screenX, screenY, ref fgRect))
+                                        {
+                                            xPx = screenX;
+                                            yPx = screenY;
+                                            heightPx = blockH;
+                                            strategy = "MyGoColorAgnosticCursorBlock";
+                                            _lastMyGoCursorFg = termFgNow;
+                                            _lastMyGoCursorTick = termNowTick;
+                                            _lastMyGoCursorXPx = xPx;
+                                            _lastMyGoCursorYPx = yPx;
+                                            _lastMyGoCursorHeightPx = heightPx;
+                                            PushMyGoBlinkFrame(termFgNow, scanLeft, scanTop, scanW, scanH, bgR, bgG, bgB, termNowTick, pixels);
+                                            return true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        PushMyGoBlinkFrame(termFgNow, scanLeft, scanTop, scanW, scanH, bgR, bgG, bgB, termNowTick, pixels);
+
+                        long termAgeMs = unchecked((uint)(termNowTick - _lastMyGoCursorTick));
+                        int lineScreenTop = scanTop + lineTopY - 12;
+                        int lineScreenBottom = scanTop + lineBottomY + 12;
+                        if (termFgNow != IntPtr.Zero &&
+                            termFgNow == _lastMyGoCursorFg &&
+                            termAgeMs <= 4500 &&
+                            _lastMyGoCursorYPx >= lineScreenTop &&
+                            _lastMyGoCursorYPx <= lineScreenBottom &&
+                            IsReasonableCaretPoint(_lastMyGoCursorXPx, _lastMyGoCursorYPx, ref fgRect))
+                        {
+                            xPx = _lastMyGoCursorXPx;
+                            yPx = _lastMyGoCursorYPx;
+                            heightPx = _lastMyGoCursorHeightPx;
+                            strategy = "MyGoTerminalCursorBlinkCached";
+                            return true;
+                        }
+                    }
+                    else
+                    {
+                        PushMyGoBlinkFrame(termFgNow, scanLeft, scanTop, scanW, scanH, bgR, bgG, bgB, termNowTick, pixels);
                     }
                 }
+
+                // Honest Fallback: If no confirmed cursor block, no temporal blink cell, and no recent confirmed cursor cache
+                // could be verified, return false (never guess a fake text-end coordinate) so OsdPlacementService.Calculate
+                // cleanly displays the flyout at the Volume OSD position (BottomCenter)!
             }
             catch
             {
@@ -1955,6 +2219,192 @@ namespace FluentOsdPro
                 if (hDib != IntPtr.Zero) DeleteObject(hDib);
                 if (memDc != IntPtr.Zero) DeleteDC(memDc);
                 if (screenDc != IntPtr.Zero) ReleaseDC(IntPtr.Zero, screenDc);
+            }
+
+            return false;
+        }
+
+        private static void PushMyGoBlinkFrame(
+            IntPtr fg,
+            int scanLeft,
+            int scanTop,
+            int scanW,
+            int scanH,
+            int bgR,
+            int bgG,
+            int bgB,
+            int nowTick,
+            int[] pixels)
+        {
+            if (fg == IntPtr.Zero || pixels == null)
+            {
+                return;
+            }
+
+            lock (_myGoBlinkLock)
+            {
+                int prevIdx = (_myGoBlinkRingWriteIndex + _myGoBlinkRing.Length - 1) % _myGoBlinkRing.Length;
+                MyGoBlinkFrame newest = _myGoBlinkRing[prevIdx];
+                if (newest != null &&
+                    newest.FgHwnd == fg &&
+                    newest.ScanW == scanW &&
+                    newest.ScanH == scanH &&
+                    unchecked((uint)(nowTick - newest.Tick)) < 110)
+                {
+                    return;
+                }
+
+                _myGoBlinkRing[_myGoBlinkRingWriteIndex] = new MyGoBlinkFrame
+                {
+                    FgHwnd = fg,
+                    ScanLeft = scanLeft,
+                    ScanTop = scanTop,
+                    ScanW = scanW,
+                    ScanH = scanH,
+                    BgR = bgR,
+                    BgG = bgG,
+                    BgB = bgB,
+                    Tick = nowTick,
+                    Pixels = pixels
+                };
+                _myGoBlinkRingWriteIndex = (_myGoBlinkRingWriteIndex + 1) % _myGoBlinkRing.Length;
+            }
+        }
+
+        private static bool TryFindTemporalBlinkCursorInBand(
+            IntPtr fg,
+            int[] currentPixels,
+            int scanLeft,
+            int scanTop,
+            int scanW,
+            int scanH,
+            int minX,
+            int maxX,
+            int minY,
+            int maxY,
+            int bgR,
+            int bgG,
+            int bgB,
+            int nowTick,
+            ref Win32Rect fgRect,
+            out int xPx,
+            out int yPx,
+            out int heightPx)
+        {
+            xPx = 0;
+            yPx = 0;
+            heightPx = 36;
+
+            if (fg == IntPtr.Zero || currentPixels == null)
+            {
+                return false;
+            }
+
+            int clampedMinX = Math.Max(4, minX);
+            int clampedMaxX = Math.Min(scanW - 4, maxX);
+            int clampedMinY = Math.Max(4, minY);
+            int clampedMaxY = Math.Min(scanH - 4, maxY);
+            if (clampedMaxX <= clampedMinX + 4 || clampedMaxY <= clampedMinY + 12)
+            {
+                return false;
+            }
+
+            MyGoBlinkFrame[] snapshots = new MyGoBlinkFrame[_myGoBlinkRing.Length];
+            lock (_myGoBlinkLock)
+            {
+                for (int i = 0; i < _myGoBlinkRing.Length; i++)
+                {
+                    snapshots[i] = _myGoBlinkRing[i];
+                }
+            }
+
+            for (int s = 0; s < snapshots.Length; s++)
+            {
+                MyGoBlinkFrame prev = snapshots[s];
+                if (prev == null ||
+                    prev.FgHwnd != fg ||
+                    prev.ScanLeft != scanLeft ||
+                    prev.ScanTop != scanTop ||
+                    prev.ScanW != scanW ||
+                    prev.ScanH != scanH ||
+                    prev.Pixels == null ||
+                    prev.Pixels.Length != currentPixels.Length)
+                {
+                    continue;
+                }
+
+                uint ageMs = unchecked((uint)(nowTick - prev.Tick));
+                if (ageMs < 120 || ageMs > 2500)
+                {
+                    continue;
+                }
+
+                if (Math.Abs(prev.BgR - bgR) + Math.Abs(prev.BgG - bgG) + Math.Abs(prev.BgB - bgB) > 24)
+                {
+                    continue;
+                }
+
+                int diffMinX = int.MaxValue;
+                int diffMaxX = int.MinValue;
+                int diffMinY = int.MaxValue;
+                int diffMaxY = int.MinValue;
+                int changedCount = 0;
+                bool tooLarge = false;
+
+                for (int y = clampedMinY; y <= clampedMaxY; y += 2)
+                {
+                    int rowOff = y * scanW;
+                    for (int x = clampedMinX; x <= clampedMaxX; x += 2)
+                    {
+                        int c1 = currentPixels[rowOff + x];
+                        int c0 = prev.Pixels[rowOff + x];
+                        if (c1 == c0)
+                        {
+                            continue;
+                        }
+
+                        int r1 = (c1 >> 16) & 0xFF, g1 = (c1 >> 8) & 0xFF, b1 = c1 & 0xFF;
+                        int r0 = (c0 >> 16) & 0xFF, g0 = (c0 >> 8) & 0xFF, b0 = c0 & 0xFF;
+                        if (Math.Abs(r1 - r0) + Math.Abs(g1 - g0) + Math.Abs(b1 - b0) >= 75)
+                        {
+                            changedCount++;
+                            if (x < diffMinX) diffMinX = x;
+                            if (x > diffMaxX) diffMaxX = x;
+                            if (y < diffMinY) diffMinY = y;
+                            if (y > diffMaxY) diffMaxY = y;
+
+                            if (diffMaxX - diffMinX > 56 || diffMaxY - diffMinY > 72 || changedCount > 950)
+                            {
+                                tooLarge = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (tooLarge)
+                    {
+                        break;
+                    }
+                }
+
+                if (!tooLarge && changedCount >= 10 && diffMaxX >= diffMinX && diffMaxY >= diffMinY)
+                {
+                    int dw = diffMaxX - diffMinX + 1;
+                    int dh = diffMaxY - diffMinY + 1;
+                    // Single or CJK double-width character cell blink: width 2..54px, height 18..66px
+                    if (dw >= 2 && dw <= 54 && dh >= 18 && dh <= 66)
+                    {
+                        int screenX = scanLeft + diffMaxX;
+                        int screenY = scanTop + diffMinY;
+                        int screenH = Math.Max(28, dh);
+                        if (IsReasonableCaretPoint(screenX, screenY, ref fgRect))
+                        {
+                            xPx = screenX;
+                            yPx = screenY;
+                            heightPx = screenH;
+                            return true;
+                        }
+                    }
+                }
             }
 
             return false;
@@ -1997,7 +2447,14 @@ namespace FluentOsdPro
             return totalSamples >= 16 && matchCount * 100 >= totalSamples * 78;
         }
 
-        private static bool TryMeasureUniformCursorBlock(
+        /// <summary>
+        /// Color-agnostic block cursor detector supporting both:
+        /// 1. Single-width ASCII cursor blocks (10..26px wide, steady or blinking, any color including solid black `█`),
+        /// 2. Double-width CJK cursor blocks (27..54px wide) with inverted white Chinese/English characters inside!
+        /// Expands vertically FIRST to locate the solid top/bottom cap rows (`top + 2`, `bottom - 2`) where no character
+        /// strokes exist, then measures the full horizontal span `[left .. right]` along those unobstructed cap rows.
+        /// </summary>
+        private static bool TryMeasureColorAgnosticCursorBlock(
             int[] pixels,
             int width,
             int height,
@@ -2006,6 +2463,9 @@ namespace FluentOsdPro
             int targetR,
             int targetG,
             int targetB,
+            int bgR,
+            int bgG,
+            int bgB,
             out int left,
             out int right,
             out int top,
@@ -2016,65 +2476,237 @@ namespace FluentOsdPro
             top = seedY;
             bottom = seedY;
 
-            while (left > 0 && IsSameRgb(pixels[seedY * width + (left - 1)], targetR, targetG, targetB))
+            // Step 1: Anti-aliased 1..2px edge inward nudging.
+            // Because the caller scans from right-to-left and bottom-to-top, (seedX, seedY) often lands on the
+            // 1px anti-aliased right or bottom border of `█`. Check 2px inward (left/up) for stronger background contrast.
+            int baseDiff = Math.Abs(targetR - bgR) + Math.Abs(targetG - bgG) + Math.Abs(targetB - bgB);
+            int[] nudgeDx = new int[] { -2, -2, 0, -3 };
+            int[] nudgeDy = new int[] { 0, -2, -2, -1 };
+            for (int n = 0; n < nudgeDx.Length; n++)
             {
-                left--;
-                if (seedX - left > 40) return false;
-            }
-            while (right < width - 1 && IsSameRgb(pixels[seedY * width + (right + 1)], targetR, targetG, targetB))
-            {
-                right++;
-                if (right - left > 40) return false;
-            }
-
-            int bw = right - left + 1;
-            if (bw < 8 || bw > 34)
-            {
-                return false;
-            }
-
-            int midX = (left + right) / 2;
-            while (top > 0 && IsSameRgb(pixels[(top - 1) * width + midX], targetR, targetG, targetB))
-            {
-                top--;
-                if (seedY - top > 72) return false;
-            }
-            while (bottom < height - 1 && IsSameRgb(pixels[(bottom + 1) * width + midX], targetR, targetG, targetB))
-            {
-                bottom++;
-                if (bottom - top > 72) return false;
-            }
-
-            int bh = bottom - top + 1;
-            // A terminal block cursor `█` is tall and narrow (aspect ratio H >= W * 1.45, e.g. 19x47).
-            // This strictly rejects 1:1 square UI badges/icons (such as the 40x40 OSD badge).
-            if (bh < 20 || bh > 68 || bh * 100 < bw * 145)
-            {
-                return false;
-            }
-
-            // Verify 100% solid interior (no inner text glyph or hole)
-            for (int py = top + 3; py <= bottom - 3; py += 3)
-            {
-                int rOff = py * width;
-                for (int px = left + 2; px <= right - 2; px += 2)
+                int nx = seedX + nudgeDx[n];
+                int ny = seedY + nudgeDy[n];
+                if (nx >= 2 && nx < width - 2 && ny >= 2 && ny < height - 2)
                 {
-                    if (!IsSameRgb(pixels[rOff + px], targetR, targetG, targetB))
+                    int nc = pixels[ny * width + nx];
+                    int nr = (nc >> 16) & 0xFF;
+                    int ng = (nc >> 8) & 0xFF;
+                    int nb = nc & 0xFF;
+                    int nDiff = Math.Abs(nr - bgR) + Math.Abs(ng - bgG) + Math.Abs(nb - bgB);
+                    if (nDiff > baseDiff + 24)
                     {
-                        return false;
+                        seedX = nx;
+                        seedY = ny;
+                        targetR = nr;
+                        targetG = ng;
+                        targetB = nb;
+                        baseDiff = nDiff;
                     }
                 }
             }
 
-            // Verify exterior horizontally is NOT the same color (must be an isolated cursor block)
-            int midY = (top + bottom) / 2;
-            if (left >= 5 && IsSameRgb(pixels[midY * width + (left - 5)], targetR, targetG, targetB))
+            // Step 2: Expand vertically FIRST along seedX (and seedX - 2) so we reach the unobstructed
+            // top cap row and bottom cap row of the block even if (seedX, seedY) is next to an inner white glyph!
+            int bestTop = seedY;
+            int bestBottom = seedY;
+            int[] initialVerticalCols = new int[] { seedX, Math.Max(1, seedX - 2), Math.Min(width - 2, seedX + 1) };
+            for (int i = 0; i < initialVerticalCols.Length; i++)
+            {
+                int px = initialVerticalCols[i];
+                if (!IsSameRgb(pixels[seedY * width + px], targetR, targetG, targetB))
+                {
+                    continue;
+                }
+                int t = seedY;
+                int b = seedY;
+                while (t > 0 && IsSameRgb(pixels[(t - 1) * width + px], targetR, targetG, targetB))
+                {
+                    t--;
+                    if (seedY - t > 72) break;
+                }
+                while (b < height - 1 && IsSameRgb(pixels[(b + 1) * width + px], targetR, targetG, targetB))
+                {
+                    b++;
+                    if (b - seedY > 72) break;
+                }
+                if (t < bestTop) bestTop = t;
+                if (b > bestBottom) bestBottom = b;
+            }
+
+            // Step 3: Expand horizontally along `seedY` AND along the unobstructed top cap (`bestTop + 1`, `bestTop + 2`)
+            // and bottom cap (`bestBottom - 1`, `bestBottom - 2`) rows so an inverted white glyph (`A` or Chinese `中`)
+            // in the middle of the cursor block NEVER stops the horizontal width measurement!
+            int bestLeft = seedX;
+            int bestRight = seedX;
+            int[] horizProbeYs = new int[]
+            {
+                seedY,
+                Math.Min(height - 2, bestTop + 1),
+                Math.Min(height - 2, bestTop + 2),
+                Math.Max(1, bestBottom - 1),
+                Math.Max(1, bestBottom - 2)
+            };
+            for (int i = 0; i < horizProbeYs.Length; i++)
+            {
+                int py = horizProbeYs[i];
+                if (!IsSameRgb(pixels[py * width + seedX], targetR, targetG, targetB))
+                {
+                    continue;
+                }
+                int l = seedX;
+                int r = seedX;
+                while (l > 0 && IsSameRgb(pixels[py * width + (l - 1)], targetR, targetG, targetB))
+                {
+                    l--;
+                    if (seedX - l > 60) return false;
+                }
+                while (r < width - 1 && IsSameRgb(pixels[py * width + (r + 1)], targetR, targetG, targetB))
+                {
+                    r++;
+                    if (r - l > 60) return false;
+                }
+                if (l < bestLeft) bestLeft = l;
+                if (r > bestRight) bestRight = r;
+            }
+
+            left = bestLeft;
+            right = bestRight;
+            int bw = right - left + 1;
+            // Support both 1-cell ASCII (10..26px) and 2-cell CJK full-width (27..54px) cursor blocks!
+            if (bw < 10 || bw > 54)
             {
                 return false;
             }
-            if (right + 5 < width && IsSameRgb(pixels[midY * width + (right + 5)], targetR, targetG, targetB))
+
+            // Step 4: Refine vertical span [top .. bottom] along left edge (`left + 2`), right edge (`right - 2`), and center
+            int[] probeXs = new int[] { Math.Min(right, left + 2), Math.Max(left, right - 2), (left + right) / 2 };
+            for (int i = 0; i < probeXs.Length; i++)
+            {
+                int px = probeXs[i];
+                int startY = IsSameRgb(pixels[seedY * width + px], targetR, targetG, targetB)
+                    ? seedY
+                    : Math.Min(height - 2, bestTop + 2);
+                if (!IsSameRgb(pixels[startY * width + px], targetR, targetG, targetB))
+                {
+                    continue;
+                }
+                int t = startY;
+                int b = startY;
+                while (t > 0 && IsSameRgb(pixels[(t - 1) * width + px], targetR, targetG, targetB))
+                {
+                    t--;
+                    if (startY - t > 72) break;
+                }
+                while (b < height - 1 && IsSameRgb(pixels[(b + 1) * width + px], targetR, targetG, targetB))
+                {
+                    b++;
+                    if (b - startY > 72) break;
+                }
+                if (t < bestTop) bestTop = t;
+                if (b > bestBottom) bestBottom = b;
+            }
+
+            top = bestTop;
+            bottom = bestBottom;
+            int bh = bottom - top + 1;
+
+            if (bh < 22 || bh > 68)
             {
                 return false;
+            }
+
+            // Aspect ratio check:
+            // - Single-width cell (bw <= 26): tall rectangle (bh >= bw * 1.35)
+            // - Double-width CJK cell (bw 27..54): near-square 2-column cell (bh >= bw * 0.78 && bh <= bw * 1.65)
+            if (bw <= 26)
+            {
+                if (bh * 100 < bw * 135)
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                if (bh * 100 < bw * 78 || bh * 100 > bw * 165)
+                {
+                    return false;
+                }
+            }
+
+            // Step 5: Verify that the inset perimeter (`top + 2`, `bottom - 2`, `left + 2`, `right - 2`)
+            // forms a solid rectangular frame of the cursor color (inset by 2px to avoid 1px anti-aliased edge dropoff).
+            int perimeterSamples = 0;
+            int perimeterMatches = 0;
+            int topCapY = Math.Min(bottom - 1, top + 2);
+            int botCapY = Math.Max(top + 1, bottom - 2);
+            int leftEdgeX = Math.Min(right - 1, left + 2);
+            int rightEdgeX = Math.Max(left + 1, right - 2);
+
+            for (int px = leftEdgeX; px <= rightEdgeX; px++)
+            {
+                perimeterSamples += 2;
+                if (IsSameRgb(pixels[topCapY * width + px], targetR, targetG, targetB)) perimeterMatches++;
+                if (IsSameRgb(pixels[botCapY * width + px], targetR, targetG, targetB)) perimeterMatches++;
+            }
+
+            for (int py = topCapY; py <= botCapY; py += 2)
+            {
+                int rOff = py * width;
+                perimeterSamples += 2;
+                if (IsSameRgb(pixels[rOff + leftEdgeX], targetR, targetG, targetB)) perimeterMatches++;
+                if (IsSameRgb(pixels[rOff + rightEdgeX], targetR, targetG, targetB)) perimeterMatches++;
+            }
+
+            if (perimeterSamples < 16 || perimeterMatches * 100 < perimeterSamples * 72)
+            {
+                return false;
+            }
+
+            // Step 6: Verify interior fill ratio:
+            // - An empty 1-cell solid block cursor has ~95%..100% cursor-color fill.
+            // - A 1-cell or 2-cell CJK block cursor sitting on top of an inverted character (`A` or Chinese `中`)
+            //   has 30%..90% cursor-color fill (the remaining pixels are the inverted glyph strokes).
+            int interiorSamples = 0;
+            int interiorCursorColorMatches = 0;
+            for (int py = topCapY; py <= botCapY; py += 2)
+            {
+                int rOff = py * width;
+                for (int px = leftEdgeX; px <= rightEdgeX; px += 2)
+                {
+                    interiorSamples++;
+                    if (IsSameRgb(pixels[rOff + px], targetR, targetG, targetB))
+                    {
+                        interiorCursorColorMatches++;
+                    }
+                }
+            }
+
+            if (interiorSamples < 12 || interiorCursorColorMatches * 100 < interiorSamples * 30)
+            {
+                return false;
+            }
+
+            // A 2-cell wide CJK block cursor (bw >= 27) ONLY exists when sitting over a wide CJK glyph,
+            // so it must contain inverted glyph strokes inside (<= 94% solid fill), preventing solid square UI icons from matching!
+            if (bw >= 27 && interiorCursorColorMatches * 100 > interiorSamples * 94)
+            {
+                return false;
+            }
+
+            // Step 7: Verify exterior horizontally (at top cap, middle, and bottom cap) is NOT the cursor block color
+            int midY = (top + bottom) / 2;
+            int[] checkYs = new int[] { topCapY, midY, botCapY };
+            for (int i = 0; i < checkYs.Length; i++)
+            {
+                int cy = checkYs[i];
+                if (left >= 5 && IsSameRgb(pixels[cy * width + (left - 5)], targetR, targetG, targetB))
+                {
+                    return false;
+                }
+                if (right + 5 < width && IsSameRgb(pixels[cy * width + (right + 5)], targetR, targetG, targetB))
+                {
+                    return false;
+                }
             }
 
             return true;

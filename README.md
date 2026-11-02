@@ -43,20 +43,26 @@
 ---
 
 ### 3. 零白屏 120Hz Windows 11 亚克力音量与大写锁定浮窗 (`Volume & CapsLock OSD`)
-- **彻底消除首次显示白屏闪烁 (`Zero First-Show White Flash`)**：
-  - 启动时在屏幕外 `(-32000, -32000)` 预创建并预热 `VolumeOsdWindow` 与 `StatusOsdWindow`，预先挂载 `DwmExtendFrameIntoClientArea(-1)`、Windows 11 原生圆角 (`DWMWCP_ROUND`) 与 `SetWindowCompositionAttribute` 亚克力毛玻璃背景。
+- **彻底消除首次显示与合盖休眠唤醒白屏闪烁 (`Zero White Flash on First-Show & Sleep-Wake`)**：
+  - 剥离 Win32 窗口类默认白底画刷（`SetClassLongPtr(GCLP_HBRBACKGROUND, IntPtr.Zero)`）并拦截 `WM_ERASEBKGND`；
+  - 监听 `WM_DISPLAYCHANGE`（合盖/切屏）与 `WM_POWERBROADCAST`（Modern Standby 休眠唤醒）自动重绑 DWM 亚克力材质；
+  - 从隐藏状态唤醒时先于屏幕外 `(-32000, -32000)` 完成 `ShowWindow` + `UpdateLayout()` + `DwmFlush()` 首帧合成，再同步移入屏幕目标位置。
 - **大写锁定矢量锁扣动画 (`CapsLock Status Flyout`)**：
   - 按下 `CapsLock` 时展示纯矢量锁头与锁梁动画（开启时锁梁闭合 `0°`，关闭时斜向弹开 `25°`）。
-- **多种浮窗位置可选**：
-  - 支持 `跟随输入光标 (InputSourcePro)`、`与音量位置相同 (底部居中自动堆叠)`、`屏幕左上角`、`屏幕右上角`、`屏幕左下角`、`屏幕右下角`、`屏幕顶部居中`。
+- **多种浮窗位置与中英双语界面 (`Multi-Position & Bilingual UI`)**：
+  - 支持 `跟随输入光标 (InputSourcePro)`、`与音量位置相同 (底部居中自动堆叠)`、`屏幕左上角`、`屏幕右上角`、`屏幕左下角`、`屏幕右下角`、`屏幕顶部居中`；
+  - 支持界面与浮窗提示词语言切换（`跟随系统 Auto` / `简体中文` / `English`）。
 
 ---
 
-### 4. UU 远程 & 中兴 VDI 本地音量与虚拟桌面守护 (`Remote & VDI Guard`)
+### 4. UU 远程 & 中兴 VDI 本地音量、虚拟桌面守护与边界物理回弹 (`Remote Guard & Desktop Boundary Bounce`)
 - **本地音量键拦截 (`Volume Up / Down / Mute`)**：当 UU 远程 (`GameViewer`) 或中兴 VDI (`uSmartView_VDI_Client` / `VirtualAppVDI`) 处于全屏或前台焦点时，键盘音量键与旋钮直接通过 Windows Core Audio (`IAudioEndpointVolume`) 调节**宿主机本地音量**并弹出亚克力音量浮窗。
 - **`Ctrl + 音量加/减` 快速切换音频输出设备 (`Audio Output Switcher`)**：按住 `Ctrl` 并滚动音量滚轮即可在本地扬声器/耳机/显示器音频之间循环切换，浮窗宽度随设备名弹性过渡。
 - **`Win + Ctrl + 左/右方向键` 切回本地虚拟桌面**：在远程全屏下直接切换宿主机本地 Windows 虚拟桌面。
-- **无边框最大化窗口任务栏唤醒守护 (`Taskbar Hover Guard`)**：自动为微信、飞书、浏览器等无边框最大化窗口注入 `NonRudeHWND=1`，确保自动隐藏任务栏（含原生任务栏与 Windhawk 任务栏）100% 正常唤出。
+- **虚拟桌面第一屏 / 末屏边界 120Hz 全屏物理回弹 (`Virtual Desktop Boundary Bounce`)**：
+  - 当已处于第 1 个虚拟桌面继续按 `Win + Ctrl + ←` 或处于最后 1 个虚拟桌面继续按 `Win + Ctrl + →` 时，触发 `1:1` 原生清晰度的 120Hz 全屏物理回弹提示（内置 **macOS 橡皮筋弹性回弹**、**左右阻尼摇头抖动**、**物理碰撞微震** 3 套预设及关闭选项）；
+  - 采用四边 `1px` 物理像素内缩覆盖层设计，规避 `explorer.exe` `ABN_FULLSCREENAPP` 全屏应用判定，确保自动隐藏任务栏绝不意外弹出；在远程桌面全屏下触达边界时保持远程窗口焦点不丢失。
+- **自动隐藏任务栏原生唤醒兼容 (`Taskbar Hover Compatibility`)**：自动清理遗留 `NonRudeHWND` 属性，确保 Windows 11 原生四边自动隐藏任务栏在虚拟桌面切换与日常悬停时 100% 正常收起与唤出。
 
 ---
 
@@ -105,10 +111,11 @@ FluentOsdPro/
     │   ├── InputMethodTracker.cs      # 按键门控、窗口切换静默期与跨布局切换追踪状态机
     │   └── InputMethodMonitor.cs      # IMM32 监控器、键盘布局切换自动恢复中文模式
     ├── Osd/
-    │   ├── NativeWindowStyler.cs      # DWM 亚克力毛玻璃、圆角边框与无焦点穿透样式
-    │   ├── OsdPlacementService.cs     # 多策略光标定位、Kero 终端光标识别、右上角与右边缘翻转计算
-    │   ├── VolumeOsdWindow.cs         # 底部居中音量与音频输出设备切换浮窗
-    │   └── StatusOsdWindow.cs         # 输入法与大写锁定胶囊浮窗 (内置 5 套 120Hz 微交互动画)
+    │   ├── NativeWindowStyler.cs             # DWM 亚克力毛玻璃、圆角边框与无焦点穿透样式
+    │   ├── OsdPlacementService.cs            # 多策略光标定位、Kero 终端单/双宽反色块光标识别与右边缘翻转
+    │   ├── DesktopBoundaryBounceService.cs   # 虚拟桌面第一屏/末屏边界判定与 120Hz 全屏橡皮筋回弹引擎
+    │   ├── VolumeOsdWindow.cs                # 底部居中音量与音频输出设备切换浮窗 (含休眠唤醒防白闪)
+    │   └── StatusOsdWindow.cs                # 输入法与大写锁定胶囊浮窗 (内置 5 套 120Hz 微交互动画)
     └── Tray/
         ├── TrayIconGenerator.cs       # 纯色深浅色自适应托盘图标生成与加载器
         ├── TrayMenuPopupWindow.cs     # 极简托盘弹出菜单
