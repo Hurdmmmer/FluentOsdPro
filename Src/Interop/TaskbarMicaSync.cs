@@ -136,11 +136,6 @@ namespace FluentOsdPro
         /// </summary>
         public static void RefreshIfNeeded()
         {
-            if (!AppSettings.Current.WallpaperColorSyncEnabled)
-            {
-                return;
-            }
-
             long nowTick = Environment.TickCount & int.MaxValue;
             long lastTick = Interlocked.Read(ref _lastQuickCheckTick);
             if (nowTick - lastTick >= 0 && nowTick - lastTick < 200)
@@ -169,33 +164,19 @@ namespace FluentOsdPro
         }
 
         /// <summary>
-        /// Immediately applies or restores wallpaper &amp; Microsoft IME color sync when toggled in Settings.
+        /// Immediately applies or restores Microsoft IME candidate window color sync when toggled in Settings.
+        /// FluentOsdPro's own OSD flyouts always use dynamic wallpaper Mica colors regardless of this toggle.
         /// </summary>
         public static void ApplySyncToggle(bool enabled)
         {
             if (enabled)
             {
-                lock (SyncRoot)
-                {
-                    _cachedStateKey = null;
-                }
-                Recompute(raiseEvent: true);
+                RefreshIfNeeded();
+                SyncMicrosoftImeCandidateTheme();
             }
             else
             {
                 RestoreMicrosoftImeDefaultTheme();
-                Interlocked.Increment(ref _signature);
-                Action handler = Changed;
-                if (handler != null)
-                {
-                    try
-                    {
-                        handler();
-                    }
-                    catch
-                    {
-                    }
-                }
             }
         }
 
@@ -223,12 +204,6 @@ namespace FluentOsdPro
         /// </summary>
         public static bool TryGetForTheme(bool isDark, out Color color)
         {
-            if (!AppSettings.Current.WallpaperColorSyncEnabled)
-            {
-                color = default(Color);
-                return false;
-            }
-
             lock (SyncRoot)
             {
                 color = _color;
@@ -589,6 +564,7 @@ namespace FluentOsdPro
 
                     root.SetValue("Updating", 0, RegistryValueKind.DWord);
                 }
+                Program.LogInfo("[WallpaperMica] WallpaperColorSyncEnabled=True -> Synced wallpaper theme to Microsoft IME (ColorPopTheme).");
             }
             catch
             {

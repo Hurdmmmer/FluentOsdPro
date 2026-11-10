@@ -304,8 +304,8 @@ namespace FluentOsdPro
                 }));
 
             root.Children.Add(CreateSettingRowCard(
-                zh ? "壁纸与输入法动态取色同步 (Wallpaper & IME Color Sync)" : "Wallpaper & IME Dynamic Color Sync",
-                zh ? "实时采样桌面壁纸云母底色与高对比强调色，同步至浮窗与系统默认微软拼音候选框（关闭即恢复默认）" : "Sync live wallpaper Mica surface and contrast accent to OSD flyouts and Microsoft IME candidate window",
+                zh ? "同步壁纸动态取色至微软输入法 (Microsoft IME Color Sync)" : "Sync Wallpaper Color to Microsoft IME",
+                zh ? "浮窗自身默认实时采样壁纸云母底色与强调色；开启后同步应用至系统微软拼音候选框（关闭即恢复输入法默认配色）" : "OSD flyouts always sample live wallpaper Mica colors; enable to also sync theme colors to Microsoft IME candidate window",
                 cardBg, cardBorder, primaryFg, secondaryFg,
                 out _wallpaperColorToggle,
                 checkedChanged: val =>
