@@ -72,6 +72,7 @@ namespace FluentOsdPro
         private const int PrimaryJapaneseLangId = 0x11;
 
         private const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
+        private const uint EVENT_OBJECT_SHOW = 0x8002;
         private const uint EVENT_OBJECT_CLOAKED = 0x8017;
         private const uint EVENT_OBJECT_UNCLOAKED = 0x8018;
         private const int OBJID_WINDOW = 0;
@@ -82,7 +83,9 @@ namespace FluentOsdPro
         private const uint WS_EX_TRANSPARENT = 0x00000020u;
         private const uint LWA_ALPHA = 0x00000002u;
         private const int SW_HIDE = 0;
+        private const int SW_MINIMIZE = 6;
         private const uint SWP_SHOWWINDOW = 0x0040;
+        private const uint SWP_HIDEWINDOW = 0x0080;
 
         private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
         private delegate void WinEventDelegate(
@@ -164,6 +167,13 @@ namespace FluentOsdPro
         [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
         private static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
 
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+
         [DllImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
@@ -225,6 +235,8 @@ namespace FluentOsdPro
         private static IntPtr _kbHookId = IntPtr.Zero;
         private static IntPtr _winEventHookFg = IntPtr.Zero;
         private static IntPtr _winEventHookCloak = IntPtr.Zero;
+        private static IntPtr _winEventHookShow = IntPtr.Zero;
+        private static long _lastNativeFlyoutSuppressArmTick;
         private static IntPtr _focusParkingHwnd = IntPtr.Zero;
         private static IntPtr _lastForegroundHwnd = IntPtr.Zero;
         private static IntPtr _lastExternalForegroundHwnd = IntPtr.Zero;
@@ -504,6 +516,8 @@ namespace FluentOsdPro
                     InitializeOsdAndImeFeatures();
                     InstallWinEventHook();
                     SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;
+                    TaskbarMicaSync.Changed += OnTaskbarMicaChanged;
+                    TaskbarMicaSync.Start();
                     HealTargetWindowsOnStartup();
                     EnsureKeyboardHookState("InitialStartup");
                     EvaluateForegroundState(GetForegroundWindow(), "InitialStartup");
@@ -529,6 +543,8 @@ namespace FluentOsdPro
                 finally
                 {
                     SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged;
+                    TaskbarMicaSync.Changed -= OnTaskbarMicaChanged;
+                    TaskbarMicaSync.Stop();
                     Cleanup();
                 }
             }
@@ -611,20 +627,55 @@ namespace FluentOsdPro
             }
         }
 
-        private static void OnUserPreferenceChanged(object sender, UserPreferenceChangedEventArgs e)
+        private static void OnTaskbarMicaChanged()
         {
-            ThemeService.RefreshThemeCache();
-
+            // Taskbar wallpaper Mica color / transparency changed (published by the Windhawk mod).
             if (_uiDispatcher != null)
             {
-                _uiDispatcher.BeginInvoke(new Action(() =>
+                _uiDispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() =>
                 {
-                    RefreshTrayIconThemeIfNeeded();
-                    _trayMenuWindow?.RefreshMenu();
                     _volumeOsdWindow?.RefreshThemeIfNeeded();
                     _statusOsdWindow?.RefreshThemeIfNeeded();
                 }));
             }
+        }
+
+        private static int _themeRefreshPending;
+
+        private static void OnUserPreferenceChanged(object sender, UserPreferenceChangedEventArgs e)
+        {
+            if (e.Category != UserPreferenceCategory.General &&
+                e.Category != UserPreferenceCategory.Color &&
+                e.Category != UserPreferenceCategory.VisualStyle)
+            {
+                return;
+            }
+
+            if (Interlocked.Exchange(ref _themeRefreshPending, 1) == 1)
+            {
+                return;
+            }
+
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                Thread.Sleep(180);
+                Interlocked.Exchange(ref _themeRefreshPending, 0);
+                ThemeService.RefreshThemeCache();
+
+                if (_uiDispatcher != null)
+                {
+                    _uiDispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() =>
+                    {
+                        RefreshTrayIconThemeIfNeeded();
+                        if (_trayMenuWindow != null && _trayMenuWindow.IsVisible)
+                        {
+                            _trayMenuWindow.RefreshMenu();
+                        }
+                        _volumeOsdWindow?.RefreshThemeIfNeeded();
+                        _statusOsdWindow?.RefreshThemeIfNeeded();
+                    }));
+                }
+            });
         }
 
         private static void RefreshTrayIconThemeIfNeeded()
@@ -1387,6 +1438,162 @@ namespace FluentOsdPro
                 0,
                 0,
                 WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+
+            _winEventHookShow = SetWinEventHook(
+                EVENT_OBJECT_SHOW,
+                EVENT_OBJECT_SHOW,
+                IntPtr.Zero,
+                _winEventProc,
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+
+            SuppressNativeVolumeFlyout("StartupInit");
+        }
+
+        public static void SuppressNativeVolumeFlyout(string reason)
+        {
+            long now = Environment.TickCount & Int32.MaxValue;
+            _lastNativeFlyoutSuppressArmTick = now;
+
+            bool checkIslands = !string.Equals(reason, "StartupInit", StringComparison.Ordinal);
+            HideNativeVolumeFlyoutWindowsOnce(checkIslands, reason);
+
+            if (checkIslands)
+            {
+                ThreadPool.QueueUserWorkItem(delegate
+                {
+                    try
+                    {
+                        Thread.Sleep(15);
+                        HideNativeVolumeFlyoutWindowsOnce(true, reason + "+15ms");
+                        Thread.Sleep(35);
+                        HideNativeVolumeFlyoutWindowsOnce(true, reason + "+50ms");
+                        Thread.Sleep(60);
+                        HideNativeVolumeFlyoutWindowsOnce(true, reason + "+110ms");
+                    }
+                    catch
+                    {
+                    }
+                });
+            }
+        }
+
+        private static void HideNativeVolumeFlyoutWindowsOnce(bool includeWin11HardwareIsland, string reason)
+        {
+            try
+            {
+                // 1. Classic / Win10 / Win11 MTC Audio Flyout Host: NativeHWNDHost -> DirectUIHWND
+                IntPtr hHost = IntPtr.Zero;
+                while ((hHost = FindWindowEx(IntPtr.Zero, hHost, "NativeHWNDHost", string.Empty)) != IntPtr.Zero)
+                {
+                    IntPtr hDirectUi = FindWindowEx(hHost, IntPtr.Zero, "DirectUIHWND", string.Empty);
+                    if (hDirectUi != IntPtr.Zero)
+                    {
+                        bool wasVis = IsWindowVisible(hHost);
+                        ShowWindowAsync(hHost, SW_MINIMIZE);
+                        ShowWindowAsync(hHost, SW_HIDE);
+                        if (wasVis)
+                        {
+                            LogInfo("Suppressed native DirectUI volume flyout (HWND=" + hHost + ", Reason=" + reason + ")");
+                        }
+                    }
+                }
+
+                if (!includeWin11HardwareIsland)
+                {
+                    return;
+                }
+
+                // 2. Windows 11 22H2/23H2/24H2 bottom-center XAML Hardware Volume Indicator: XamlExplorerHostIslandWindow
+                IntPtr hIsland = IntPtr.Zero;
+                while ((hIsland = FindWindowEx(IntPtr.Zero, hIsland, "XamlExplorerHostIslandWindow", null)) != IntPtr.Zero)
+                {
+                    TrySuppressWin11HardwareFlyoutIsland(hIsland, reason);
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private static bool TrySuppressWin11HardwareFlyoutIsland(IntPtr hwnd, string reason)
+        {
+            if (hwnd == IntPtr.Zero || !IsWindow(hwnd) || !IsWindowVisible(hwnd) || IsWindowCloaked(hwnd))
+            {
+                return false;
+            }
+
+            // Hardware volume/brightness indicator island has an empty title (unlike "Task Switching" or "ControlCenterWindow")
+            StringBuilder titleSb = new StringBuilder(64);
+            if (GetWindowText(hwnd, titleSb, titleSb.Capacity) > 0 && titleSb.Length > 0)
+            {
+                return false;
+            }
+
+            Win32Rect rect;
+            if (!GetWindowRect(hwnd, out rect))
+            {
+                return false;
+            }
+
+            int w = rect.Right - rect.Left;
+            int h = rect.Bottom - rect.Top;
+
+            // Win11 bottom-center volume indicator pill is compact (approx 160..760px wide, 32..300px tall even at 200% DPI)
+            if (w >= 100 && w <= 780 && h >= 28 && h <= 320)
+            {
+                ShowWindowAsync(hwnd, SW_HIDE);
+                SetWindowPos(
+                    hwnd,
+                    IntPtr.Zero,
+                    -32000,
+                    -32000,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_HIDEWINDOW | SWP_NOSENDCHANGING);
+                LogInfo("Suppressed Win11 XamlExplorerHostIslandWindow volume flyout (HWND=" + hwnd + ", Size=" + w + "x" + h + ", Reason=" + reason + ")");
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool IsWithinNativeFlyoutSuppressWindow()
+        {
+            long now = Environment.TickCount & Int32.MaxValue;
+            long elapsed = now - _lastNativeFlyoutSuppressArmTick;
+            return elapsed >= 0 && elapsed < 1200;
+        }
+
+        private static void TrySuppressNativeFlyoutOnWinEvent(IntPtr hwnd, string reason)
+        {
+            if (hwnd == IntPtr.Zero || !IsWithinNativeFlyoutSuppressWindow())
+            {
+                return;
+            }
+
+            StringBuilder clsSb = new StringBuilder(64);
+            if (GetClassName(hwnd, clsSb, clsSb.Capacity) <= 0)
+            {
+                return;
+            }
+
+            string cls = clsSb.ToString();
+            if (string.Equals(cls, "NativeHWNDHost", StringComparison.OrdinalIgnoreCase))
+            {
+                IntPtr hDirectUi = FindWindowEx(hwnd, IntPtr.Zero, "DirectUIHWND", string.Empty);
+                if (hDirectUi != IntPtr.Zero)
+                {
+                    ShowWindowAsync(hwnd, SW_MINIMIZE);
+                    ShowWindowAsync(hwnd, SW_HIDE);
+                    LogInfo("Suppressed native DirectUI volume flyout on " + reason + " (HWND=" + hwnd + ")");
+                }
+            }
+            else if (string.Equals(cls, "XamlExplorerHostIslandWindow", StringComparison.OrdinalIgnoreCase))
+            {
+                TrySuppressWin11HardwareFlyoutIsland(hwnd, reason);
+            }
         }
 
         private static void WinEventCallback(
@@ -1398,6 +1605,13 @@ namespace FluentOsdPro
             uint dwEventThread,
             uint dwmsEventTime)
         {
+            if (eventType == EVENT_OBJECT_SHOW)
+            {
+                if (idObject != OBJID_WINDOW || hwnd == IntPtr.Zero) return;
+                TrySuppressNativeFlyoutOnWinEvent(hwnd, "EVENT_OBJECT_SHOW");
+                return;
+            }
+
             if (eventType == EVENT_OBJECT_CLOAKED)
             {
                 if (idObject != OBJID_WINDOW || hwnd == IntPtr.Zero) return;
@@ -1411,6 +1625,7 @@ namespace FluentOsdPro
             if (eventType == EVENT_OBJECT_UNCLOAKED)
             {
                 if (idObject != OBJID_WINDOW || hwnd == IntPtr.Zero) return;
+                TrySuppressNativeFlyoutOnWinEvent(hwnd, "EVENT_OBJECT_UNCLOAKED");
                 if ((_cloakedTargetHwnds.Contains(hwnd) || IsWindowTargetProcess(hwnd)) &&
                     IsWindow(hwnd) && IsWindowVisible(hwnd) && !IsWindowCloaked(hwnd))
                 {
@@ -1780,6 +1995,10 @@ namespace FluentOsdPro
                         else
                         {
                             _hookShiftTapCandidate = false;
+                            if (!IsPotentialImeSwitchKey(vkCode))
+                            {
+                                OsdPlacementService.InvalidateCaretCache();
+                            }
                         }
                     }
                     else if (isUp)
@@ -1793,6 +2012,10 @@ namespace FluentOsdPro
                         else
                         {
                             _hookShiftTapCandidate = false;
+                            if (!IsPotentialImeSwitchKey(vkCode))
+                            {
+                                OsdPlacementService.InvalidateCaretCache();
+                            }
                         }
                     }
 
@@ -1962,7 +2185,7 @@ namespace FluentOsdPro
                             }
 
                             IntPtr currentFg = GetForegroundWindow();
-                            bool targetActive = (currentFg != IntPtr.Zero && IsWindowTargetProcess(currentFg) && IsWindowMaximizedOrCoveringMonitor(currentFg)) || _inDesktopSwitchSession;
+                            bool targetActive = (currentFg != IntPtr.Zero && IsWindowTargetProcess(currentFg)) || _inDesktopSwitchSession;
 
                             if (targetActive)
                             {
@@ -2154,6 +2377,7 @@ namespace FluentOsdPro
 
             _imeMonitor?.Dispose();
             _imeMonitor = null;
+            AudioVolumeController.Shutdown();
 
             if (_lastCheckedTaskbarRemoteSuppressed)
             {
@@ -2171,6 +2395,12 @@ namespace FluentOsdPro
             {
                 UnhookWinEvent(_winEventHookCloak);
                 _winEventHookCloak = IntPtr.Zero;
+            }
+
+            if (_winEventHookShow != IntPtr.Zero)
+            {
+                UnhookWinEvent(_winEventHookShow);
+                _winEventHookShow = IntPtr.Zero;
             }
 
             if (_focusParkingHwnd != IntPtr.Zero)

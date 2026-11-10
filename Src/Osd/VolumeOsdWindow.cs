@@ -385,20 +385,31 @@ namespace FluentOsdPro
             }
             if (msg == WmDisplayChange ||
                 msg == WmPowerBroadcast ||
-                msg == WmSettingChange ||
-                msg == WmThemeChanged ||
-                msg == WmDwmCompositionChanged ||
-                msg == WmDwmColorizationColorChanged)
+                msg == WmDwmCompositionChanged)
             {
                 // Re-assert DWM Acrylic & theme brushes offscreen immediately on lid close/open,
                 // battery/AC switch, sleep resume, or display topology change so the next popup never flashes white!
-                Dispatcher.BeginInvoke(DispatcherPriority.Render, new Action(() =>
+                Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() =>
                 {
                     if (_hwnd != IntPtr.Zero)
                     {
                         ApplyTheme(force: true);
-                        InvalidateVisual();
-                        UpdateLayout();
+                        if (IsVisible)
+                        {
+                            InvalidateVisual();
+                        }
+                    }
+                }));
+            }
+            else if (msg == WmSettingChange ||
+                     msg == WmThemeChanged ||
+                     msg == WmDwmColorizationColorChanged)
+            {
+                Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() =>
+                {
+                    if (_hwnd != IntPtr.Zero)
+                    {
+                        ApplyTheme(force: false);
                     }
                 }));
             }
@@ -476,6 +487,8 @@ namespace FluentOsdPro
             {
                 Prewarm();
             }
+
+            TaskbarMicaSync.RefreshIfNeeded();
 
             // Force DWM Acrylic & theme brush re-assertion whenever waking from Hidden state
             // so lid-close / sleep-resume / battery-saver transitions never leave an invalid DWM surface!
@@ -910,22 +923,39 @@ namespace FluentOsdPro
             }
         }
 
+        private Color _lastAppliedAccent;
+        private long _lastMicaSignature = -1;
+
         private void ApplyTheme(bool force)
         {
             bool isDark = ThemeService.IsSystemDarkTheme();
             bool isLight = !isDark;
             bool enableAcrylic = ThemeService.IsSystemTransparencyEnabled();
+            Color accentColor = ThemeService.GetAccentColor();
+            long micaSignature = TaskbarMicaSync.Signature;
 
-            if (!force && _lastAppliedDark == isDark && _lastAppliedAcrylic == enableAcrylic)
+            bool styleChanged = force || _lastAppliedDark != isDark || _lastAppliedAcrylic != enableAcrylic ||
+                                _lastMicaSignature != micaSignature;
+            if (!styleChanged && _lastAppliedAccent == accentColor)
+            {
+                return;
+            }
+
+            _lastAppliedAccent = accentColor;
+            SolidColorBrush accentBrush = CreateFrozenBrush(accentColor);
+            _sliderTrackFill.Background = accentBrush;
+            _sliderThumbInner.Fill = accentBrush;
+
+            if (!styleChanged)
             {
                 return;
             }
 
             _lastAppliedDark = isDark;
             _lastAppliedAcrylic = enableAcrylic;
+            _lastMicaSignature = micaSignature;
 
             Color primaryColor = isLight ? Color.FromArgb(0xE4, 0, 0, 0) : Colors.White;
-            Color accentColor = ThemeService.GetAccentColor();
             Color trackRemainColor = isLight
                 ? Color.FromArgb(0x22, 0, 0, 0)
                 : Color.FromArgb(0x24, 0xFF, 0xFF, 0xFF);
@@ -935,20 +965,18 @@ namespace FluentOsdPro
                 : Color.FromArgb(0x28, 0x00, 0x00, 0x00);
 
             SolidColorBrush primaryBrush = CreateFrozenBrush(primaryColor);
-            SolidColorBrush accentBrush = CreateFrozenBrush(accentColor);
 
             _cardBorder.Background = enableAcrylic
                 ? Brushes.Transparent
-                : CreateFrozenBrush(isLight ? Color.FromRgb(0xF9, 0xF9, 0xF9) : Color.FromRgb(0x2C, 0x2C, 0x2C));
+                : CreateFrozenBrush(ThemeService.GetOsdSurfaceColor(
+                    isDark, isLight ? Color.FromRgb(0xF9, 0xF9, 0xF9) : Color.FromRgb(0x2C, 0x2C, 0x2C)));
 
             _headerIconGlyph.Foreground = primaryBrush;
             _titleBlock.Foreground = primaryBrush;
             _volumeValueBlock.Foreground = primaryBrush;
             _sliderTrackBg.Background = CreateFrozenBrush(trackRemainColor);
-            _sliderTrackFill.Background = accentBrush;
             _sliderThumbOuter.Fill = CreateFrozenBrush(thumbOuterFill);
             _sliderThumbOuter.Stroke = CreateFrozenBrush(thumbOuterStroke);
-            _sliderThumbInner.Fill = accentBrush;
 
             if (_hwnd != IntPtr.Zero)
             {

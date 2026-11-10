@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -207,7 +207,9 @@ namespace FluentOsdPro
                             {
                                 newName = devices[targetIndex].DisplayName;
                             }
+                            _lastProgrammaticSwitchTick = Environment.TickCount & Int32.MaxValue;
                             UpdateCachedDefaultDeviceName(newName);
+                            AudioVolumeController.NotifyDefaultEndpointSwitchedProgrammatically();
                             return new SwitchResult
                             {
                                 DisplayName = newName,
@@ -391,6 +393,15 @@ namespace FluentOsdPro
 
         private static string _cachedDefaultDeviceName = string.Empty;
         private static long _cachedDefaultDeviceTick;
+        private static long _lastProgrammaticSwitchTick;
+
+        public static long LastProgrammaticSwitchTick => _lastProgrammaticSwitchTick;
+
+        public static void InvalidateDefaultDeviceCache()
+        {
+            _cachedDefaultDeviceName = string.Empty;
+            _cachedDefaultDeviceTick = 0;
+        }
 
         private static void UpdateCachedDefaultDeviceName(string name)
         {
@@ -596,14 +607,14 @@ namespace FluentOsdPro
         }
 
         [StructLayout(LayoutKind.Sequential)]
-        private struct PropertyKey
+        internal struct PropertyKey
         {
             public Guid fmtid;
             public int pid;
         }
 
         [StructLayout(LayoutKind.Explicit, Size = 24)]
-        private struct PropVariant
+        internal struct PropVariant
         {
             [FieldOffset(0)] public ushort vt;
             [FieldOffset(8)] public IntPtr pointerValue;
@@ -636,7 +647,7 @@ namespace FluentOsdPro
 
         [ComImport]
         [Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
-        private class MMDeviceEnumeratorComObject
+        internal class MMDeviceEnumeratorComObject
         {
         }
 
@@ -649,19 +660,31 @@ namespace FluentOsdPro
         [ComImport]
         [Guid("A95664D2-9614-4F35-A746-DE8DB63617E6")]
         [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-        private interface IMMDeviceEnumerator
+        internal interface IMMDeviceEnumerator
         {
             [PreserveSig] int EnumAudioEndpoints(int dataFlow, int dwStateMask, out IMMDeviceCollection devices);
             [PreserveSig] int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice endpoint);
             [PreserveSig] int GetDevice([MarshalAs(UnmanagedType.LPWStr)] string id, out IMMDevice device);
-            [PreserveSig] int RegisterEndpointNotificationCallback(IntPtr client);
-            [PreserveSig] int UnregisterEndpointNotificationCallback(IntPtr client);
+            [PreserveSig] int RegisterEndpointNotificationCallback([MarshalAs(UnmanagedType.Interface)] IMMNotificationClient client);
+            [PreserveSig] int UnregisterEndpointNotificationCallback([MarshalAs(UnmanagedType.Interface)] IMMNotificationClient client);
+        }
+
+        [ComImport]
+        [Guid("7991EEC9-7E89-4D85-8390-6C703CEC60C0")]
+        [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        internal interface IMMNotificationClient
+        {
+            [PreserveSig] int OnDeviceStateChanged([MarshalAs(UnmanagedType.LPWStr)] string pwstrDeviceId, uint dwNewState);
+            [PreserveSig] int OnDeviceAdded([MarshalAs(UnmanagedType.LPWStr)] string pwstrDeviceId);
+            [PreserveSig] int OnDeviceRemoved([MarshalAs(UnmanagedType.LPWStr)] string pwstrDeviceId);
+            [PreserveSig] int OnDefaultDeviceChanged(int flow, int role, [MarshalAs(UnmanagedType.LPWStr)] string pwstrDefaultDeviceId);
+            [PreserveSig] int OnPropertyValueChanged([MarshalAs(UnmanagedType.LPWStr)] string pwstrDeviceId, PropertyKey key);
         }
 
         [ComImport]
         [Guid("0BD7A1BE-7A1A-44DB-8397-CC5392387B5E")]
         [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-        private interface IMMDeviceCollection
+        internal interface IMMDeviceCollection
         {
             [PreserveSig] int GetCount(out uint count);
             [PreserveSig] int Item(uint index, out IMMDevice device);
@@ -670,7 +693,7 @@ namespace FluentOsdPro
         [ComImport]
         [Guid("D666063F-1587-4E43-81F1-B948E807363F")]
         [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-        private interface IMMDevice
+        internal interface IMMDevice
         {
             [PreserveSig] int Activate(ref Guid iid, uint clsCtx, IntPtr activationParams, [MarshalAs(UnmanagedType.IUnknown)] out object interfacePointer);
             [PreserveSig] int OpenPropertyStore(uint stgmAccess, out IPropertyStore properties);
@@ -681,7 +704,7 @@ namespace FluentOsdPro
         [ComImport]
         [Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99")]
         [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-        private interface IPropertyStore
+        internal interface IPropertyStore
         {
             [PreserveSig] int GetCount(out uint propCount);
             [PreserveSig] int GetAt(uint property, out PropertyKey key);
@@ -732,9 +755,21 @@ namespace FluentOsdPro
     internal static class AudioVolumeController
     {
         private static readonly Guid IidIAudioEndpointVolume = new Guid("5CDF2C82-841E-4546-9722-0CF74078229A");
+        // Unique event context GUID used by FluentOsdPro when stepping volume or toggling mute via keyboard hook,
+        // so IAudioEndpointVolumeCallback.OnNotify can distinguish our own changes from external Bluetooth AVRCP changes.
+        private static readonly Guid OurVolumeEventContext = new Guid("7F8A41C2-93E5-4B18-A402-554C564F5344");
         private const float StepSize = 0.02f;
         private static readonly object VolumeLock = new object();
         private static Action<VolumeState> _onChanged;
+
+        private static AudioDeviceSwitcher.IMMDeviceEnumerator _notificationEnumerator;
+        private static DefaultDeviceNotificationClient _deviceNotificationClient;
+        private static IAudioEndpointVolume _subscribedEndpointVolume;
+        private static EndpointVolumeCallback _volumeCallback;
+        private static string _subscribedDeviceId = string.Empty;
+        private static int _lastNotifiedPercent = -1;
+        private static bool? _lastNotifiedMuted;
+        private static long _lastRebindTick;
 
         public sealed class VolumeState
         {
@@ -749,6 +784,198 @@ namespace FluentOsdPro
         public static void Init(Action<VolumeState> onChanged)
         {
             _onChanged = onChanged;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                InitializeHardwareVolumeNotifications();
+            });
+        }
+
+        public static void Shutdown()
+        {
+            lock (VolumeLock)
+            {
+                UnbindEndpointVolumeNotificationLocked();
+
+                if (_notificationEnumerator != null && _deviceNotificationClient != null)
+                {
+                    try
+                    {
+                        _notificationEnumerator.UnregisterEndpointNotificationCallback(_deviceNotificationClient);
+                    }
+                    catch
+                    {
+                    }
+                }
+
+                if (_notificationEnumerator != null)
+                {
+                    try
+                    {
+                        Marshal.FinalReleaseComObject(_notificationEnumerator);
+                    }
+                    catch
+                    {
+                    }
+                    _notificationEnumerator = null;
+                }
+                _deviceNotificationClient = null;
+            }
+        }
+
+        public static void NotifyDefaultEndpointSwitchedProgrammatically()
+        {
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                RebindEndpointVolumeNotification(showOsdOnDeviceSwitch: false);
+            });
+        }
+
+        private static void InitializeHardwareVolumeNotifications()
+        {
+            lock (VolumeLock)
+            {
+                try
+                {
+                    if (_notificationEnumerator == null)
+                    {
+                        _notificationEnumerator = (AudioDeviceSwitcher.IMMDeviceEnumerator)new AudioDeviceSwitcher.MMDeviceEnumeratorComObject();
+                        _deviceNotificationClient = new DefaultDeviceNotificationClient();
+                        _notificationEnumerator.RegisterEndpointNotificationCallback(_deviceNotificationClient);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Program.LogError("Failed to register IMMNotificationClient", ex);
+                }
+            }
+
+            RebindEndpointVolumeNotification(showOsdOnDeviceSwitch: false);
+        }
+
+        private static void RebindEndpointVolumeNotification(bool showOsdOnDeviceSwitch)
+        {
+            VolumeState switchedState = null;
+            lock (VolumeLock)
+            {
+                try
+                {
+                    UnbindEndpointVolumeNotificationLocked();
+                    AudioDeviceSwitcher.InvalidateDefaultDeviceCache();
+
+                    IAudioEndpointVolume vol = ActivateVolume();
+                    if (vol == null)
+                    {
+                        return;
+                    }
+
+                    float level = 0.0f;
+                    bool muted = false;
+                    vol.GetMasterVolumeLevelScalar(out level);
+                    vol.GetMute(out muted);
+
+                    _lastNotifiedPercent = (int)Math.Round(level * 100.0f);
+                    _lastNotifiedMuted = muted;
+                    _lastRebindTick = Environment.TickCount & Int32.MaxValue;
+
+                    _volumeCallback = new EndpointVolumeCallback();
+                    int hr = vol.RegisterControlChangeNotify(_volumeCallback);
+                    if (hr == 0)
+                    {
+                        _subscribedEndpointVolume = vol;
+                        string devName = AudioDeviceSwitcher.GetDefaultDeviceDisplayName();
+                        Program.LogInfo("Bound IAudioEndpointVolumeCallback to default audio endpoint: " + devName + " (Vol=" + _lastNotifiedPercent + "%, Muted=" + muted + ")");
+                        if (showOsdOnDeviceSwitch)
+                        {
+                            switchedState = new VolumeState
+                            {
+                                DeviceName = devName,
+                                Level = level,
+                                Muted = muted
+                            };
+                        }
+                    }
+                    else
+                    {
+                        Marshal.FinalReleaseComObject(vol);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Program.LogError("RebindEndpointVolumeNotification failed", ex);
+                }
+            }
+
+            if (switchedState != null && _onChanged != null)
+            {
+                _onChanged(switchedState);
+            }
+        }
+
+        private static void UnbindEndpointVolumeNotificationLocked()
+        {
+            if (_subscribedEndpointVolume != null)
+            {
+                try
+                {
+                    if (_volumeCallback != null)
+                    {
+                        _subscribedEndpointVolume.UnregisterControlChangeNotify(_volumeCallback);
+                    }
+                }
+                catch
+                {
+                }
+
+                try
+                {
+                    Marshal.FinalReleaseComObject(_subscribedEndpointVolume);
+                }
+                catch
+                {
+                }
+                _subscribedEndpointVolume = null;
+            }
+            _volumeCallback = null;
+        }
+
+        private static void OnExternalHardwareVolumeChanged(float level, bool muted)
+        {
+            // Immediately suppress the native Windows volume flyout triggered by Bluetooth AVRCP
+            Program.SuppressNativeVolumeFlyout("BluetoothAvrcpNotify");
+
+            int pct = (int)Math.Round(Math.Max(0.0f, Math.Min(1.0f, level)) * 100.0f);
+            string devName;
+            lock (VolumeLock)
+            {
+                long now = Environment.TickCount & Int32.MaxValue;
+                bool inConnectGracePeriod = (now - _lastRebindTick) >= 0 && (now - _lastRebindTick) < 1800;
+                if (inConnectGracePeriod)
+                {
+                    _lastNotifiedPercent = pct;
+                    _lastNotifiedMuted = muted;
+                    Program.LogInfo("Ignored initial endpoint volume sync during connect grace period (" + pct + "%, Muted=" + muted + ")");
+                    return;
+                }
+
+                if (_lastNotifiedPercent == pct && _lastNotifiedMuted.HasValue && _lastNotifiedMuted.Value == muted)
+                {
+                    return;
+                }
+                _lastNotifiedPercent = pct;
+                _lastNotifiedMuted = muted;
+                devName = AudioDeviceSwitcher.GetDefaultDeviceDisplayName();
+            }
+
+            Program.LogInfo("External/Bluetooth AVRCP volume change detected -> " + devName + " (" + pct + "%, Muted=" + muted + ")");
+            if (_onChanged != null)
+            {
+                _onChanged(new VolumeState
+                {
+                    DeviceName = devName,
+                    Level = level,
+                    Muted = muted
+                });
+            }
         }
 
         public static void TriggerStepVolume(bool up)
@@ -879,7 +1106,7 @@ namespace FluentOsdPro
                     if (next > 1.0f) next = 1.0f;
                     if (next < 0.0f) next = 0.0f;
 
-                    Guid ctx = Guid.Empty;
+                    Guid ctx = OurVolumeEventContext;
                     hr = volume.SetMasterVolumeLevelScalar(next, ref ctx);
                     if (hr != 0)
                     {
@@ -889,6 +1116,9 @@ namespace FluentOsdPro
 
                     bool muted;
                     volume.GetMute(out muted);
+                    _lastNotifiedPercent = (int)Math.Round(next * 100.0f);
+                    _lastNotifiedMuted = muted;
+
                     return new VolumeState
                     {
                         DeviceName = AudioDeviceSwitcher.GetDefaultDeviceDisplayName(),
@@ -923,7 +1153,7 @@ namespace FluentOsdPro
                         return null;
                     }
 
-                    Guid ctx = Guid.Empty;
+                    Guid ctx = OurVolumeEventContext;
                     hr = volume.SetMute(!muted, ref ctx);
                     if (hr != 0)
                     {
@@ -933,6 +1163,9 @@ namespace FluentOsdPro
 
                     float level;
                     volume.GetMasterVolumeLevelScalar(out level);
+                    _lastNotifiedPercent = (int)Math.Round(level * 100.0f);
+                    _lastNotifiedMuted = !muted;
+
                     return new VolumeState
                     {
                         DeviceName = AudioDeviceSwitcher.GetDefaultDeviceDisplayName(),
@@ -953,13 +1186,131 @@ namespace FluentOsdPro
             return (IAudioEndpointVolume)AudioDeviceSwitcher.ActivateDefaultRenderEndpointInterface(iid);
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        private struct AudioVolumeNotificationData
+        {
+            public Guid guidEventContext;
+            [MarshalAs(UnmanagedType.Bool)]
+            public bool bMuted;
+            public float fMasterVolume;
+            public uint nChannels;
+        }
+
+        [ComImport]
+        [Guid("657804FA-D6AD-4496-8A60-352752AF4F89")]
+        [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IAudioEndpointVolumeCallback
+        {
+            [PreserveSig]
+            int OnNotify(IntPtr pNotify);
+        }
+
+        private sealed class EndpointVolumeCallback : IAudioEndpointVolumeCallback
+        {
+            public int OnNotify(IntPtr pNotify)
+            {
+                if (pNotify == IntPtr.Zero)
+                {
+                    return 0;
+                }
+
+                try
+                {
+                    AudioVolumeNotificationData data = (AudioVolumeNotificationData)Marshal.PtrToStructure(
+                        pNotify,
+                        typeof(AudioVolumeNotificationData));
+
+                    // Ignore volume notifications originating from our own keyboard hook StepVolumeCore / ToggleMuteCore
+                    if (data.guidEventContext == OurVolumeEventContext)
+                    {
+                        return 0;
+                    }
+
+                    // Pre-emptively arm native volume flyout suppression as soon as hardware/AVRCP callback arrives
+                    Program.SuppressNativeVolumeFlyout("EndpointVolumeCallback");
+
+                    float level = data.fMasterVolume;
+                    bool muted = data.bMuted;
+                    ThreadPool.QueueUserWorkItem(delegate
+                    {
+                        OnExternalHardwareVolumeChanged(level, muted);
+                    });
+                }
+                catch
+                {
+                }
+
+                return 0;
+            }
+        }
+
+        private sealed class DefaultDeviceNotificationClient : AudioDeviceSwitcher.IMMNotificationClient
+        {
+            public int OnDeviceStateChanged(string pwstrDeviceId, uint dwNewState)
+            {
+                return 0;
+            }
+
+            public int OnDeviceAdded(string pwstrDeviceId)
+            {
+                return 0;
+            }
+
+            public int OnDeviceRemoved(string pwstrDeviceId)
+            {
+                return 0;
+            }
+
+            public int OnDefaultDeviceChanged(int flow, int role, string pwstrDefaultDeviceId)
+            {
+                // EDataFlowRender = 0, ERoleMultimedia = 1
+                if (flow != 0 || role != 1)
+                {
+                    return 0;
+                }
+
+                string newId = pwstrDefaultDeviceId ?? string.Empty;
+                long now = Environment.TickCount & Int32.MaxValue;
+                lock (VolumeLock)
+                {
+                    if (string.Equals(_subscribedDeviceId, newId, StringComparison.OrdinalIgnoreCase) &&
+                        (now - _lastRebindTick) >= 0 && (now - _lastRebindTick) < 400)
+                    {
+                        return 0;
+                    }
+                    _subscribedDeviceId = newId;
+                    _lastRebindTick = now;
+                }
+
+                bool wasProgrammatic = (now - AudioDeviceSwitcher.LastProgrammaticSwitchTick) >= 0 &&
+                                       (now - AudioDeviceSwitcher.LastProgrammaticSwitchTick) < 600;
+                ThreadPool.QueueUserWorkItem(delegate
+                {
+                    // Allow Bluetooth AVRCP endpoint properties 120ms to settle when newly connected
+                    if (!wasProgrammatic)
+                    {
+                        Thread.Sleep(120);
+                    }
+                    // Never pop up the Volume OSD merely because a Bluetooth headset connected or disconnected;
+                    // only rebind silently so subsequent volume adjustments on the headset trigger the OSD.
+                    RebindEndpointVolumeNotification(showOsdOnDeviceSwitch: false);
+                });
+                return 0;
+            }
+
+            public int OnPropertyValueChanged(string pwstrDeviceId, AudioDeviceSwitcher.PropertyKey key)
+            {
+                return 0;
+            }
+        }
+
         [ComImport]
         [Guid("5CDF2C82-841E-4546-9722-0CF74078229A")]
         [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
         private interface IAudioEndpointVolume
         {
-            [PreserveSig] int RegisterControlChangeNotify(IntPtr notify);
-            [PreserveSig] int UnregisterControlChangeNotify(IntPtr notify);
+            [PreserveSig] int RegisterControlChangeNotify([MarshalAs(UnmanagedType.Interface)] IAudioEndpointVolumeCallback notify);
+            [PreserveSig] int UnregisterControlChangeNotify([MarshalAs(UnmanagedType.Interface)] IAudioEndpointVolumeCallback notify);
             [PreserveSig] int GetChannelCount(out uint count);
             [PreserveSig] int SetMasterVolumeLevel(float levelDb, ref Guid eventContext);
             [PreserveSig] int SetMasterVolumeLevelScalar(float level, ref Guid eventContext);

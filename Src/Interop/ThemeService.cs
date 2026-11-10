@@ -87,14 +87,52 @@ namespace FluentOsdPro
 
         public static System.Windows.Media.Color GetAccentColor()
         {
+            // Derive a deeper / brighter variant of the wallpaper Mica hue so the accent
+            // stays clearly distinguishable (>= 3:1 contrast) from the OSD background.
+            // Falls back to the system accent for near-grey backgrounds.
+            bool isDark = IsSystemDarkTheme();
+            System.Windows.Media.Color micaBackground;
+            if (TaskbarMicaSync.TryGetForTheme(isDark, out micaBackground))
+            {
+                System.Windows.Media.Color? derived = TaskbarMicaSync.DeriveAccent(micaBackground, isDark);
+                if (derived.HasValue)
+                {
+                    return derived.Value;
+                }
+            }
+
             try
             {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent", false))
+                {
+                    if (key != null)
+                    {
+                        byte[] palette = key.GetValue("AccentPalette") as byte[];
+                        if (palette != null && palette.Length >= 16)
+                        {
+                            // Bytes 12..14 store the primary SystemAccentColor (R, G, B)
+                            return System.Windows.Media.Color.FromRgb(palette[12], palette[13], palette[14]);
+                        }
+                    }
+                }
                 return SystemParameters.WindowGlassColor;
             }
             catch
             {
                 return System.Windows.Media.Color.FromRgb(0x00, 0x78, 0xD4);
             }
+        }
+
+        /// <summary>
+        /// Solid OSD surface color used when acrylic is disabled: the wallpaper Mica color when
+        /// it matches the current theme, otherwise the supplied default.
+        /// </summary>
+        public static System.Windows.Media.Color GetOsdSurfaceColor(bool isDark, System.Windows.Media.Color fallback)
+        {
+            System.Windows.Media.Color micaBackground;
+            return TaskbarMicaSync.TryGetForTheme(isDark, out micaBackground)
+                ? micaBackground
+                : fallback;
         }
 
         public static bool IsSystemDarkTheme()

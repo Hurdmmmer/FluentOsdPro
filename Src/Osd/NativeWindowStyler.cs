@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Runtime.InteropServices;
 
 namespace FluentOsdPro
@@ -115,13 +115,24 @@ namespace FluentOsdPro
                 return;
             }
 
+            // GradientColor layout is 0xAABBGGRR (NOT RGB). Use FluentOsdPro's own
+            // standalone wallpaper Mica color + user-configured OsdTransparency (0..100).
+            uint tint = isDarkTheme ? DarkTintColor : LightTintColor;
+            int transPct = Math.Max(0, Math.Min(100, AppSettings.Current.OsdTransparency));
+            uint alpha = (uint)Math.Max(1, Math.Min(255, (int)Math.Round(255.0 * (1.0 - transPct / 100.0))));
+            System.Windows.Media.Color mica;
+            if (TaskbarMicaSync.TryGetForTheme(isDarkTheme, out mica))
+            {
+                tint = ((uint)mica.B << 16) | ((uint)mica.G << 8) | mica.R;
+            }
+
             AccentPolicy accent = new AccentPolicy
             {
                 AccentState = enableAcrylic
                     ? (int)AccentState.EnableAcrylicBlurBehind
                     : (int)AccentState.Disabled,
                 AccentFlags = 0,
-                GradientColor = unchecked((int)((AcrylicOpacity << 24) | (isDarkTheme ? DarkTintColor : LightTintColor)))
+                GradientColor = unchecked((int)((alpha << 24) | tint))
             };
 
             int size = Marshal.SizeOf(accent);

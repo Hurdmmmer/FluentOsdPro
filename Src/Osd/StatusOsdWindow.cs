@@ -414,10 +414,7 @@ namespace FluentOsdPro
 
             if (msg == WmDisplayChange ||
                 msg == WmPowerBroadcast ||
-                msg == WmSettingChange ||
-                msg == WmThemeChanged ||
-                msg == WmDwmCompositionChanged ||
-                msg == WmDwmColorizationColorChanged)
+                msg == WmDwmCompositionChanged)
             {
                 _lastAppliedDark = null;
                 _lastAppliedAcrylic = null;
@@ -426,9 +423,26 @@ namespace FluentOsdPro
                     if (_hwnd != IntPtr.Zero)
                     {
                         ApplyCurrentTheme(force: true);
-                        InvalidateVisual();
+                        if (IsVisible)
+                        {
+                            InvalidateVisual();
+                        }
                     }
-                }), DispatcherPriority.Send);
+                }), DispatcherPriority.Background);
+            }
+            else if (msg == WmSettingChange ||
+                     msg == WmThemeChanged ||
+                     msg == WmDwmColorizationColorChanged)
+            {
+                TaskbarMicaSync.NotifySettingChange();
+                Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    if (_hwnd != IntPtr.Zero)
+                    {
+                        TaskbarMicaSync.RefreshIfNeeded();
+                        ApplyCurrentTheme(force: false);
+                    }
+                }), DispatcherPriority.Background);
             }
 
             return IntPtr.Zero;
@@ -578,6 +592,7 @@ namespace FluentOsdPro
             string fixedWidthReference)
         {
             EnsurePrewarmed();
+            TaskbarMicaSync.RefreshIfNeeded();
 
             OsdAnimationStyle animStyle = AppSettings.Current.StatusOsdAnimationStyle;
             bool animate = animStyle != OsdAnimationStyle.None;
@@ -587,6 +602,9 @@ namespace FluentOsdPro
             bool isLock = visualMode == OsdVisualMode.CapsLock;
             _lockSymbol.Visibility = isLock ? Visibility.Visible : Visibility.Collapsed;
             _iconText.Visibility = isLock ? Visibility.Collapsed : Visibility.Visible;
+
+            // Update theme & wallpaper Mica/accent brushes BEFORE AnimateState -> ApplyBadgeColors
+            ApplyCurrentTheme(force: !wasVisible);
 
             // Evaluate state & label transitions BEFORE overwriting _last* fields so in-place switching animations fire properly
             AnimateState(visualMode, isEnabled, badgeGlyph, animStyle, animate && wasVisible);
@@ -599,7 +617,7 @@ namespace FluentOsdPro
             _lastTitleText = title;
             _lastDetailText = string.Empty;
 
-            ApplyCurrentTheme(force: !wasVisible);
+            ApplyBadgeColors(isEnabled);
             UpdateFlyoutWidth(title, fixedWidthReference);
 
             Rect? stackAboveVolume = null;
@@ -649,20 +667,40 @@ namespace FluentOsdPro
             }
         }
 
+        private Color _lastAppliedAccent;
+        private long _lastMicaSignature = -1;
+
         private void ApplyCurrentTheme(bool force = false)
         {
             bool isDark = ThemeService.IsSystemDarkTheme();
             bool isLight = !isDark;
             bool enableAcrylic = ThemeService.IsSystemTransparencyEnabled();
+            bool syncWallpaperColor = AppSettings.Current.WallpaperColorSyncEnabled;
+            Color accentColor = syncWallpaperColor
+                ? ThemeService.GetAccentColor()
+                : (isLight ? Color.FromArgb(0xEB, 0x18, 0x18, 0x1B) : Color.FromArgb(0xF2, 0xF5, 0xF6, 0xF8));
+            long micaSignature = TaskbarMicaSync.Signature;
 
-            // InputSourcePro IndicatorColor.swift + IndicatorViewConfig.swift:
-            // Dark mode: bgColor = #141416, textColor = #FFFFFF
-            // Light mode: bgColor = #FFFFFF (0.95), textColor = #141416
-            // Leading 16x16 badge is filled with textColor, and the glyph inside uses bgColor!
+            if (!force &&
+                _lastMicaSignature == micaSignature &&
+                _lastAppliedAccent == accentColor &&
+                _lastAppliedDark.HasValue && _lastAppliedDark.Value == isDark &&
+                _lastAppliedAcrylic.HasValue && _lastAppliedAcrylic.Value == enableAcrylic)
+            {
+                return;
+            }
+
+            _lastAppliedAccent = accentColor;
+
+            // Use the derived wallpaper accent color (>= 3:1 contrast against the wallpaper Mica
+            // background) for the leading 16x16 IME badge and active CapsLock icon, and pick a
+            // high-contrast glyph foreground inside the badge.
             Color textColor = isLight ? Color.FromArgb(0xF5, 0x14, 0x14, 0x16) : Color.FromArgb(0xFA, 0xFF, 0xFF, 0xFF);
             Color dimmedTextColor = isLight ? Color.FromArgb(0xB8, 0x14, 0x14, 0x16) : Color.FromArgb(0xC8, 0xFF, 0xFF, 0xFF);
-            Color badgeFillColor = isLight ? Color.FromArgb(0xEB, 0x18, 0x18, 0x1B) : Color.FromArgb(0xF2, 0xF5, 0xF6, 0xF8);
-            Color badgeGlyphContrast = isLight ? Color.FromRgb(0xFF, 0xFF, 0xFF) : Color.FromRgb(0x14, 0x14, 0x16);
+            Color badgeFillColor = accentColor;
+            Color badgeGlyphContrast = TaskbarMicaSync.IsColorLight(badgeFillColor)
+                ? Color.FromRgb(0x14, 0x14, 0x16)
+                : Color.FromRgb(0xFF, 0xFF, 0xFF);
 
             _activeForegroundBrush = CreateFrozenBrush(textColor);
             _dimmedForegroundBrush = CreateFrozenBrush(dimmedTextColor);
@@ -678,15 +716,18 @@ namespace FluentOsdPro
 
             _surface.Background = enableAcrylic
                 ? Brushes.Transparent
-                : CreateFrozenBrush(isLight ? Color.FromRgb(0xFF, 0xFF, 0xFF) : Color.FromRgb(0x16, 0x17, 0x1A));
+                : CreateFrozenBrush(ThemeService.GetOsdSurfaceColor(
+                    isDark, isLight ? Color.FromRgb(0xFF, 0xFF, 0xFF) : Color.FromRgb(0x16, 0x17, 0x1A)));
 
             if (_hwnd != IntPtr.Zero &&
                 (force ||
+                 _lastMicaSignature != micaSignature ||
                  !_lastAppliedDark.HasValue || _lastAppliedDark.Value != isDark ||
                  !_lastAppliedAcrylic.HasValue || _lastAppliedAcrylic.Value != enableAcrylic))
             {
                 _lastAppliedDark = isDark;
                 _lastAppliedAcrylic = enableAcrylic;
+                _lastMicaSignature = micaSignature;
                 NativeWindowStyler.ApplyOsdWindowStyle(_hwnd, isDark, enableAcrylic, clickThrough: false);
             }
         }
@@ -698,15 +739,15 @@ namespace FluentOsdPro
             {
                 _iconBadge.Background = Brushes.Transparent;
                 _iconBadge.BorderThickness = new Thickness(0);
-                SolidColorBrush lockBrush = isEnabled ? _activeForegroundBrush : _dimmedForegroundBrush;
+                SolidColorBrush lockBrush = isEnabled ? (_activeAccentBrush ?? _activeForegroundBrush) : _dimmedForegroundBrush;
                 _lockBodyPath.Fill = lockBrush;
                 _lockDotPath.Fill = lockBrush;
                 _lockShacklePath.Fill = lockBrush;
             }
             else
             {
-                // InputSourcePro IndicatorViewConfig.swift (getGlyphBadgeView / getTextImageView):
-                // Solid textColor 16x16 rounded square (cornerRadius = 3) with inverted bgColor glyph inside
+                // 16x16 rounded square (cornerRadius = 3) filled with the wallpaper-derived accent color
+                // and high-contrast glyph inside.
                 _iconBadge.Background = _activeAccentBrush;
                 _iconBadge.BorderThickness = new Thickness(0);
                 _iconText.Foreground = _activeBadgeFgBrush;

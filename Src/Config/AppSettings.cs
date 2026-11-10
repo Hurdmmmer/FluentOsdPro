@@ -48,6 +48,8 @@ namespace FluentOsdPro
         public bool GuardEnabled { get; set; } = true;
         public bool ImeFlyoutEnabled { get; set; } = true;
         public bool CapsLockFlyoutEnabled { get; set; } = true;
+        public bool WallpaperColorSyncEnabled { get; set; } = true;
+        public int OsdTransparency { get; set; } = 30;
         public OsdAnimationStyle StatusOsdAnimationStyle { get; set; } = OsdAnimationStyle.SpringPop;
         public DesktopBoundaryFeedbackStyle BoundaryFeedbackStyle { get; set; } = DesktopBoundaryFeedbackStyle.RubberBandBounce;
         public AppLanguage Language { get; set; } = AppLanguage.Auto;
@@ -115,6 +117,12 @@ namespace FluentOsdPro
                 settings.GuardEnabled = ReadBool(json, "GuardEnabled", true);
                 settings.ImeFlyoutEnabled = ReadBool(json, "ImeFlyoutEnabled", true);
                 settings.CapsLockFlyoutEnabled = ReadBool(json, "CapsLockFlyoutEnabled", true);
+                settings.WallpaperColorSyncEnabled = ReadBool(json, "WallpaperColorSyncEnabled", true);
+                string transStr = ReadString(json, "OsdTransparency", "30");
+                if (int.TryParse(transStr, out int parsedTrans))
+                {
+                    settings.OsdTransparency = Math.Max(0, Math.Min(100, parsedTrans));
+                }
                 bool animEnabled = ReadBool(json, "OsdAnimationEnabled", true);
                 settings.StatusOsdAnimationStyle = animEnabled ? OsdAnimationStyle.SpringPop : OsdAnimationStyle.None;
 
@@ -191,6 +199,8 @@ namespace FluentOsdPro
                     sb.AppendLine("  \"GuardEnabled\": " + (GuardEnabled ? "true" : "false") + ",");
                     sb.AppendLine("  \"ImeFlyoutEnabled\": " + (ImeFlyoutEnabled ? "true" : "false") + ",");
                     sb.AppendLine("  \"CapsLockFlyoutEnabled\": " + (CapsLockFlyoutEnabled ? "true" : "false") + ",");
+                    sb.AppendLine("  \"WallpaperColorSyncEnabled\": " + (WallpaperColorSyncEnabled ? "true" : "false") + ",");
+                    sb.AppendLine("  \"OsdTransparency\": " + OsdTransparency.ToString() + ",");
                     sb.AppendLine("  \"OsdAnimationEnabled\": " + (OsdAnimationEnabled ? "true" : "false") + ",");
                     sb.AppendLine("  \"StatusOsdAnimationStyle\": \"" + StatusOsdAnimationStyle.ToString() + "\",");
                     sb.AppendLine("  \"StatusOsdPosition\": \"" + StatusOsdPosition.ToString() + "\",");

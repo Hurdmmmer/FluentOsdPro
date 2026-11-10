@@ -34,6 +34,9 @@ namespace FluentOsdPro
         private CheckBox _autoStartToggle;
         private CheckBox _imeToggle;
         private CheckBox _capsToggle;
+        private CheckBox _wallpaperColorToggle;
+        private Slider _transparencySlider;
+        private TextBlock _transparencyValueText;
         private ComboBox _animStyleCombo;
         private ComboBox _positionCombo;
         private ComboBox _boundaryCombo;
@@ -141,6 +144,9 @@ namespace FluentOsdPro
                 if (_autoStartToggle != null) _autoStartToggle.IsChecked = AutoStartManager.IsAutoStartEnabled();
                 if (_imeToggle != null) _imeToggle.IsChecked = s.ImeFlyoutEnabled;
                 if (_capsToggle != null) _capsToggle.IsChecked = s.CapsLockFlyoutEnabled;
+                if (_wallpaperColorToggle != null) _wallpaperColorToggle.IsChecked = s.WallpaperColorSyncEnabled;
+                if (_transparencySlider != null) _transparencySlider.Value = s.OsdTransparency;
+                if (_transparencyValueText != null) _transparencyValueText.Text = s.OsdTransparency.ToString() + "%";
 
                 if (_animStyleCombo != null)
                 {
@@ -296,6 +302,96 @@ namespace FluentOsdPro
                     AppSettings.Current.Save();
                     Program.EnsureKeyboardHookState("SettingsToggleCapsLock");
                 }));
+
+            root.Children.Add(CreateSettingRowCard(
+                zh ? "壁纸与输入法动态取色同步 (Wallpaper & IME Color Sync)" : "Wallpaper & IME Dynamic Color Sync",
+                zh ? "实时采样桌面壁纸云母底色与高对比强调色，同步至浮窗与系统默认微软拼音候选框（关闭即恢复默认）" : "Sync live wallpaper Mica surface and contrast accent to OSD flyouts and Microsoft IME candidate window",
+                cardBg, cardBorder, primaryFg, secondaryFg,
+                out _wallpaperColorToggle,
+                checkedChanged: val =>
+                {
+                    AppSettings.Current.WallpaperColorSyncEnabled = val;
+                    AppSettings.Current.Save();
+                    TaskbarMicaSync.ApplySyncToggle(val);
+                    Program.ShowImePreview(0);
+                }));
+
+            // Section 2.4: OSD Acrylic Transparency Slider (0% ~ 100%)
+            Border transCard = new Border
+            {
+                Background = new SolidColorBrush(cardBg),
+                BorderBrush = new SolidColorBrush(cardBorder),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(8),
+                Padding = new Thickness(14, 11, 14, 11),
+                Margin = new Thickness(0, 0, 0, 8)
+            };
+
+            Grid transGrid = new Grid();
+            transGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            transGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+            StackPanel transTextStack = new StackPanel { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 12, 0) };
+            transTextStack.Children.Add(new TextBlock
+            {
+                Text = zh ? "浮窗亚克力背景透明度 (OSD Acrylic Transparency)" : "OSD Acrylic Transparency",
+                FontSize = 13.5,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = new SolidColorBrush(primaryFg)
+            });
+            transTextStack.Children.Add(new TextBlock
+            {
+                Text = zh ? "拖动滑块无级调节音量与输入法浮窗的背景通透度（0% 纯色不透明 ~ 100% 全透模糊，拖动时实时预览）" : "Adjust OSD background acrylic transparency (0% opaque ~ 100% full blur) with live preview",
+                FontSize = 11.5,
+                Margin = new Thickness(0, 3, 0, 0),
+                TextWrapping = TextWrapping.Wrap,
+                Foreground = new SolidColorBrush(secondaryFg)
+            });
+            Grid.SetColumn(transTextStack, 0);
+            transGrid.Children.Add(transTextStack);
+
+            StackPanel sliderRightPanel = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+
+            _transparencySlider = CreateFluentSlider(isDark, accentColor, 168);
+            _transparencyValueText = new TextBlock
+            {
+                Width = 42,
+                TextAlignment = TextAlignment.Right,
+                VerticalAlignment = VerticalAlignment.Center,
+                FontSize = 12.5,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = new SolidColorBrush(primaryFg),
+                Margin = new Thickness(6, 0, 0, 0),
+                Text = AppSettings.Current.OsdTransparency.ToString() + "%"
+            };
+
+            _transparencySlider.ValueChanged += (s, e) =>
+            {
+                int val = (int)Math.Round(e.NewValue);
+                if (_transparencyValueText != null)
+                {
+                    _transparencyValueText.Text = val.ToString() + "%";
+                }
+                if (_suppressEvents) return;
+                if (AppSettings.Current.OsdTransparency != val)
+                {
+                    AppSettings.Current.OsdTransparency = val;
+                    AppSettings.Current.Save();
+                    TaskbarMicaSync.NotifyTransparencyChanged();
+                    Program.ShowImePreview(0);
+                }
+            };
+
+            sliderRightPanel.Children.Add(_transparencySlider);
+            sliderRightPanel.Children.Add(_transparencyValueText);
+            Grid.SetColumn(sliderRightPanel, 1);
+            transGrid.Children.Add(sliderRightPanel);
+            transCard.Child = transGrid;
+            root.Children.Add(transCard);
 
             // Section 2.5: OSD Animation Style Selector (5 presets)
             Border animCard = new Border
@@ -817,6 +913,70 @@ namespace FluentOsdPro
             toggleBox = cb;
             card.Child = grid;
             return card;
+        }
+
+        private static Slider CreateFluentSlider(bool isDark, Color accentColor, double width)
+        {
+            string accentHex = string.Format("#{0:X2}{1:X2}{2:X2}", accentColor.R, accentColor.G, accentColor.B);
+            string trackRemainHex = isDark ? "#45FFFFFF" : "#28000000";
+            string thumbOuterHex = isDark ? "#FF383C44" : "#FFFFFFFF";
+            string thumbStrokeHex = isDark ? "#55FFFFFF" : "#30000000";
+
+            string xaml =
+                "<ControlTemplate xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' " +
+                "xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' TargetType='Slider'>" +
+                "<Grid Height='24' Background='Transparent'>" +
+                "<Track x:Name='PART_Track'>" +
+                "<Track.DecreaseRepeatButton>" +
+                "<RepeatButton Command='Slider.DecreaseLarge' Focusable='False'>" +
+                "<RepeatButton.Template><ControlTemplate TargetType='RepeatButton'>" +
+                "<Border Height='4' CornerRadius='2' VerticalAlignment='Center' Background='" + accentHex + "'/>" +
+                "</ControlTemplate></RepeatButton.Template>" +
+                "</RepeatButton>" +
+                "</Track.DecreaseRepeatButton>" +
+                "<Track.IncreaseRepeatButton>" +
+                "<RepeatButton Command='Slider.IncreaseLarge' Focusable='False'>" +
+                "<RepeatButton.Template><ControlTemplate TargetType='RepeatButton'>" +
+                "<Border Height='4' CornerRadius='2' VerticalAlignment='Center' Background='" + trackRemainHex + "'/>" +
+                "</ControlTemplate></RepeatButton.Template>" +
+                "</RepeatButton>" +
+                "</Track.IncreaseRepeatButton>" +
+                "<Track.Thumb>" +
+                "<Thumb Focusable='False'>" +
+                "<Thumb.Template><ControlTemplate TargetType='Thumb'>" +
+                "<Grid Width='16' Height='16'>" +
+                "<Ellipse Fill='" + thumbOuterHex + "' Stroke='" + thumbStrokeHex + "' StrokeThickness='1'/>" +
+                "<Ellipse x:Name='InnerDot' Width='8.5' Height='8.5' Fill='" + accentHex + "' HorizontalAlignment='Center' VerticalAlignment='Center'/>" +
+                "</Grid>" +
+                "<ControlTemplate.Triggers>" +
+                "<Trigger Property='IsMouseOver' Value='True'>" +
+                "<Setter TargetName='InnerDot' Property='Width' Value='10.5'/>" +
+                "<Setter TargetName='InnerDot' Property='Height' Value='10.5'/>" +
+                "</Trigger>" +
+                "</ControlTemplate.Triggers>" +
+                "</ControlTemplate></Thumb.Template>" +
+                "</Thumb>" +
+                "</Track.Thumb>" +
+                "</Track>" +
+                "</Grid>" +
+                "</ControlTemplate>";
+
+            ControlTemplate sliderTemplate = (ControlTemplate)System.Windows.Markup.XamlReader.Parse(xaml);
+
+            return new Slider
+            {
+                Width = width,
+                Minimum = 0,
+                Maximum = 100,
+                SmallChange = 1,
+                LargeChange = 10,
+                IsSnapToTickEnabled = true,
+                TickFrequency = 1,
+                IsMoveToPointEnabled = true,
+                VerticalAlignment = VerticalAlignment.Center,
+                Cursor = Cursors.Hand,
+                Template = sliderTemplate
+            };
         }
 
         private static CheckBox CreateFluentToggleSwitch(bool isDark)

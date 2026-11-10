@@ -694,6 +694,21 @@ namespace FluentOsdPro
         }
 
         /// <summary>
+        /// Invalidates cached caret coordinates immediately when the user types, presses navigation keys
+        /// (Enter, Backspace, Arrows, Tab), or switches foreground windows so subsequent IME switches
+        /// never reuse a stale caret position from before the keystroke.
+        /// </summary>
+        public static void InvalidateCaretCache()
+        {
+            lock (_caretCacheLock)
+            {
+                _lastCaretLookupSuccess = false;
+                _lastCaretLookupTick = 0;
+            }
+            _lastMyGoCursorTick = 0;
+        }
+
+        /// <summary>
         /// Triggered on IME hotkey press (e.g. Shift keydown) ~60-120ms before the OSD pops up,
         /// warming up the renderer and prefetching the caret on a background MTA thread.
         /// </summary>
@@ -714,6 +729,14 @@ namespace FluentOsdPro
             {
                 try
                 {
+                    long now = Environment.TickCount & int.MaxValue;
+                    if (fg != _lastWarmedFg || (now - _lastWarmedTick) >= 800)
+                    {
+                        _lastWarmedFg = fg;
+                        _lastWarmedTick = now;
+                        WarmUpWindowTreeSync(fg);
+                    }
+
                     if (TryComputeTextCaretPhysicalPoint(fg, out int cx, out int cy, out int ch, out string strategy))
                     {
                         lock (_caretCacheLock)
@@ -842,6 +865,22 @@ namespace FluentOsdPro
             {
                 strategy = "MsaaCaret";
                 return true;
+            }
+
+            // 2b. If MSAA caret was not immediately available (e.g., user just switched tabs or opened a new
+            //     Chrome_RenderWidgetHostHWND inside the same top-level window), warm up focusHwnd and child
+            //     render windows right now before querying UIA and re-checking MSAA.
+            if (focusHwnd != IntPtr.Zero && focusHwnd != fg)
+            {
+                WarmUpSingleWindowAccessibility(focusHwnd);
+            }
+            WarmUpSingleWindowAccessibility(fg);
+            if (childRenderWindows != null)
+            {
+                for (int i = 0; i < childRenderWindows.Count; i++)
+                {
+                    WarmUpSingleWindowAccessibility(childRenderWindows[i]);
+                }
             }
 
             // 3. UIA (CUIAutomation8 TextPattern2::GetCaretRange + TextPattern::GetSelection + ExpandToEnclosingUnit
@@ -1021,19 +1060,7 @@ namespace FluentOsdPro
                     {
                     }
 
-                    string uiaDiag = string.Empty;
-                    if (isMyGo || procName.IndexOf("Kero", StringComparison.OrdinalIgnoreCase) >= 0)
-                    {
-                        IntPtr targetUiaHwnd = (hasGui && guiInfo.hwndFocus != IntPtr.Zero)
-                            ? guiInfo.hwndFocus
-                            : (children.Count > 0 ? children[0] : fg);
-                        uiaDiag = ", UiaDiag=" + InspectUiaTreeDiagnostic(fg, targetUiaHwnd);
-                    }
-
-                    Program.LogInfo("[OSD-WarmUp] HWND=" + fg + " (" + procName + "/" + fgCls + ", PID=" + pid +
-                                    ", Rect=" + r.Left + "," + r.Top + ".." + r.Right + "," + r.Bottom +
-                                    ", Focus=" + guiInfo.hwndFocus + ", CaretLoc=" + cx + "," + cy + ",h=" + ch +
-                                    ", Children=" + children.Count + childSummary + uiaDiag + ")");
+                    // Disabled verbose UiaDiag full tree walk & disk logging on every WarmUp to avoid UI/hook latency.
                 }
                 catch
                 {
@@ -1577,7 +1604,7 @@ namespace FluentOsdPro
                     {
                         try
                         {
-                            if ((!isSubtreeChild || hasFocus != 0 || isActive != 0 || isMyGoSurface) &&
+                            if ((!isSubtreeChild || hasFocus != 0 || (isMyGoSurface && isActive != 0)) &&
                                 TryExtractCaretFromNativeTextRange(caretRange, ref fgRect, out xPx, out yPx, out heightPx))
                             {
                                 strategy = "NativeUia8_TextPattern2";
@@ -1615,7 +1642,7 @@ namespace FluentOsdPro
                                 {
                                     try
                                     {
-                                        if ((!isSubtreeChild || hasFocus != 0 || isMyGoSurface) &&
+                                        if ((!isSubtreeChild || hasFocus != 0) &&
                                             TryExtractCaretFromNativeTextRange(selectionRange, ref fgRect, out xPx, out yPx, out heightPx))
                                         {
                                             strategy = "NativeUia8_TextPattern";
@@ -2032,7 +2059,7 @@ namespace FluentOsdPro
                     int boxScreenBottom = scanTop + boxBottomY + 6;
                     if (fgNow != IntPtr.Zero &&
                         fgNow == _lastMyGoCursorFg &&
-                        ageMs <= 4500 &&
+                        ageMs <= 1200 &&
                         _lastMyGoCursorYPx >= boxScreenTop &&
                         _lastMyGoCursorYPx <= boxScreenBottom &&
                         IsReasonableCaretPoint(_lastMyGoCursorXPx, _lastMyGoCursorYPx, ref fgRect))
@@ -2188,7 +2215,7 @@ namespace FluentOsdPro
                         int lineScreenBottom = scanTop + lineBottomY + 12;
                         if (termFgNow != IntPtr.Zero &&
                             termFgNow == _lastMyGoCursorFg &&
-                            termAgeMs <= 4500 &&
+                            termAgeMs <= 1200 &&
                             _lastMyGoCursorYPx >= lineScreenTop &&
                             _lastMyGoCursorYPx <= lineScreenBottom &&
                             IsReasonableCaretPoint(_lastMyGoCursorXPx, _lastMyGoCursorYPx, ref fgRect))
