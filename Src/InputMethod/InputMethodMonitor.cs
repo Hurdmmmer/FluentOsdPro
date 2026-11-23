@@ -124,7 +124,7 @@ namespace FluentOsdPro
                 return;
             }
 
-            long nowTick = Environment.TickCount & int.MaxValue;
+            long nowTick = Program.MonotonicTickMs();
             _tracker.NotifyUserKeyActivity(nowTick);
 
             if (scheduleQuickCheck)
@@ -160,7 +160,7 @@ namespace FluentOsdPro
             _quickCheckTimer.Stop();
             _followUpCheckTimer.Stop();
             _pendingForceEmit = false;
-            long nowTick = Environment.TickCount & int.MaxValue;
+            long nowTick = Program.MonotonicTickMs();
             _tracker.NotifyUserKeyActivity(nowTick);
             PollOnce(forceEmit: true);
         }
@@ -172,7 +172,7 @@ namespace FluentOsdPro
                 return;
             }
 
-            long nowTick = Environment.TickCount & int.MaxValue;
+            long nowTick = Program.MonotonicTickMs();
             _tracker.NotifyUserKeyActivity(nowTick);
             _pendingForceEmit = true;
             _followUpCheckTimer.Stop();
@@ -188,7 +188,7 @@ namespace FluentOsdPro
                 return;
             }
 
-            long nowTick = Environment.TickCount & int.MaxValue;
+            long nowTick = Program.MonotonicTickMs();
             _tracker.ResetWindowQuietPeriod(hwnd, nowTick);
         }
 
@@ -270,7 +270,7 @@ namespace FluentOsdPro
                 return;
             }
 
-            long nowTick = Environment.TickCount & int.MaxValue;
+            long nowTick = Program.MonotonicTickMs();
 
             // When the user actively switches keyboard layouts from a non-Chinese layout (e.g. 0x0409 English)
             // to the Chinese IME (0x0804), automatically ensure Chinese native conversion mode ("中") is active.

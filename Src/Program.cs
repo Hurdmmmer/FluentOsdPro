@@ -236,7 +236,7 @@ namespace FluentOsdPro
         private static IntPtr _winEventHookFg = IntPtr.Zero;
         private static IntPtr _winEventHookCloak = IntPtr.Zero;
         private static IntPtr _winEventHookShow = IntPtr.Zero;
-        private static long _lastNativeFlyoutSuppressArmTick;
+        private static long _lastNativeFlyoutSuppressArmTick = -10000L;
         private static IntPtr _focusParkingHwnd = IntPtr.Zero;
         private static IntPtr _lastForegroundHwnd = IntPtr.Zero;
         private static IntPtr _lastExternalForegroundHwnd = IntPtr.Zero;
@@ -282,8 +282,13 @@ namespace FluentOsdPro
         private static bool _hookShiftDown;
         private static bool _hookShiftTapCandidate;
         private static bool _inDesktopSwitchSession;
-        private static long _lastDesktopSwitchTick;
+        private static long _lastDesktopSwitchTick = -10000L;
         private static int _watchdogRetopCounter;
+
+        public static long MonotonicTickMs()
+        {
+            return (long)(Stopwatch.GetTimestamp() * 1000.0 / Stopwatch.Frequency);
+        }
         private static bool _volumeSessionLogged;
         private static IntPtr _lastLoggedTargetHwnd = IntPtr.Zero;
 
@@ -671,6 +676,10 @@ namespace FluentOsdPro
                         {
                             _trayMenuWindow.RefreshMenu();
                         }
+                        if (_settingsWindow != null && _settingsWindow.IsLoaded)
+                        {
+                            _settingsWindow.RefreshThemeAndLanguage();
+                        }
                         _volumeOsdWindow?.RefreshThemeIfNeeded();
                         _statusOsdWindow?.RefreshThemeIfNeeded();
                     }));
@@ -736,6 +745,17 @@ namespace FluentOsdPro
                 _trayMenuWindow?.Hide();
                 OpenSettingsWindow();
             };
+        }
+
+        public static void RefreshTrayMenuAndTooltip()
+        {
+            if (_trayIcon != null)
+            {
+                _trayIcon.Text = ThemeService.IsSystemChinese()
+                    ? "Fluent OSD Pro · 光标输入法浮窗 & 音量守护"
+                    : "Fluent OSD Pro · Caret IME & Volume Flyout";
+            }
+            _trayMenuWindow?.RefreshMenu();
         }
 
         public static void OpenSettingsWindow()
@@ -1011,7 +1031,7 @@ namespace FluentOsdPro
                     }
                 }
 
-                bool needHook = _isGuardEnabled || AppSettings.Current.CapsLockFlyoutEnabled;
+                bool needHook = ShouldKeyboardHookBeActive();
                 if (needHook && (!_isHookActive || _kbHookId == IntPtr.Zero))
                 {
                     ReinstallKeyboardHookToTop("Watchdog_EnsureHookActive");
@@ -1453,7 +1473,7 @@ namespace FluentOsdPro
 
         public static void SuppressNativeVolumeFlyout(string reason)
         {
-            long now = Environment.TickCount & Int32.MaxValue;
+            long now = MonotonicTickMs();
             _lastNativeFlyoutSuppressArmTick = now;
 
             bool checkIslands = !string.Equals(reason, "StartupInit", StringComparison.Ordinal);
@@ -1561,7 +1581,7 @@ namespace FluentOsdPro
 
         private static bool IsWithinNativeFlyoutSuppressWindow()
         {
-            long now = Environment.TickCount & Int32.MaxValue;
+            long now = MonotonicTickMs();
             long elapsed = now - _lastNativeFlyoutSuppressArmTick;
             return elapsed >= 0 && elapsed < 1200;
         }
@@ -1689,13 +1709,17 @@ namespace FluentOsdPro
             EvaluateForegroundState(effectiveHwnd, "WinEvent_ForegroundChanged");
         }
 
+        private static bool ShouldKeyboardHookBeActive()
+        {
+            return _isGuardEnabled ||
+                   AppSettings.Current.CapsLockFlyoutEnabled ||
+                   AppSettings.Current.ImeFlyoutEnabled ||
+                   AppSettings.Current.BoundaryFeedbackStyle != DesktopBoundaryFeedbackStyle.None;
+        }
+
         public static void EnsureKeyboardHookState(string reason)
         {
-            bool shouldBeActive = _isGuardEnabled ||
-                                  AppSettings.Current.CapsLockFlyoutEnabled ||
-                                  AppSettings.Current.ImeFlyoutEnabled ||
-                                  AppSettings.Current.BoundaryFeedbackStyle != DesktopBoundaryFeedbackStyle.None;
-            if (!shouldBeActive)
+            if (!ShouldKeyboardHookBeActive())
             {
                 UninstallKeyboardHook(reason);
             }
@@ -2128,13 +2152,17 @@ namespace FluentOsdPro
 
                         return (IntPtr)1;
                     }
+                }
 
-                    // Never intercept synthetic key events injected by our own keybd_event
-                    if ((flags & LLKHF_INJECTED) != 0 && extraInfo == OurInjectedExtraInfo)
-                    {
-                        return CallNextHookEx(_kbHookId, nCode, wParam, lParam);
-                    }
+                // Never intercept synthetic key events injected by our own keybd_event
+                if ((flags & LLKHF_INJECTED) != 0 && extraInfo == OurInjectedExtraInfo)
+                {
+                    return CallNextHookEx(_kbHookId, nCode, wParam, lParam);
+                }
 
+                DesktopBoundaryFeedbackStyle boundaryStyle = AppSettings.Current.BoundaryFeedbackStyle;
+                if (_isGuardEnabled || boundaryStyle != DesktopBoundaryFeedbackStyle.None)
+                {
                     // Track physical Win & Ctrl modifier states
                     if (vkCode == VK_LWIN || vkCode == VK_RWIN)
                     {
@@ -2155,7 +2183,7 @@ namespace FluentOsdPro
                         }
                     }
 
-                    // 2. Intercept Win + Ctrl + Left/Right Arrow -> Boundary Bounce & Switch Local Virtual Desktop
+                    // 2. Observe Win + Ctrl + Left/Right Arrow -> Boundary Bounce & (when Guard is enabled) Switch Local Virtual Desktop
                     if (vkCode == VK_LEFT || vkCode == VK_RIGHT)
                     {
                         bool winHeld = _physWinDown || IsKeyPhysicallyDown(VK_LWIN) || IsKeyPhysicallyDown(VK_RWIN);
@@ -2164,7 +2192,6 @@ namespace FluentOsdPro
                         if (winHeld && ctrlHeld)
                         {
                             bool goingLeft = vkCode == VK_LEFT;
-                            DesktopBoundaryFeedbackStyle boundaryStyle = AppSettings.Current.BoundaryFeedbackStyle;
                             bool atBoundary = false;
 
                             if (isDown)
@@ -2184,52 +2211,55 @@ namespace FluentOsdPro
                                 }
                             }
 
-                            IntPtr currentFg = GetForegroundWindow();
-                            bool targetActive = (currentFg != IntPtr.Zero && IsWindowTargetProcess(currentFg)) || _inDesktopSwitchSession;
-
-                            if (targetActive)
+                            if (_isGuardEnabled)
                             {
-                                if (isDown)
+                                IntPtr currentFg = GetForegroundWindow();
+                                bool targetActive = (currentFg != IntPtr.Zero && IsWindowTargetProcess(currentFg)) || _inDesktopSwitchSession;
+
+                                if (targetActive)
                                 {
-                                    // If already at the first/last virtual desktop and not mid-switch session,
-                                    // keep focus inside the remote desktop window while showing the boundary bounce!
-                                    if (atBoundary && !_inDesktopSwitchSession)
+                                    if (isDown)
                                     {
-                                        return (IntPtr)1;
-                                    }
-
-                                    _physWinDown = true;
-                                    _physCtrlDown = true;
-                                    _inDesktopSwitchSession = true;
-                                    _desktopSwitchEndTimer?.Stop();
-                                    if (_desktopSwitchSafetyTimer != null)
-                                    {
-                                        _desktopSwitchSafetyTimer.Stop();
-                                        _desktopSwitchSafetyTimer.Start();
-                                    }
-
-                                    byte arrowByte = (byte)vkCode;
-                                    if (currentFg != IntPtr.Zero && IsWindowTargetProcess(currentFg))
-                                    {
-                                        _desktopSwitchSourceHwnd = currentFg;
-                                    }
-                                    else if (_desktopSwitchSourceHwnd == IntPtr.Zero && IsWindowTargetProcess(_lastExternalForegroundHwnd))
-                                    {
-                                        _desktopSwitchSourceHwnd = _lastExternalForegroundHwnd;
-                                    }
-
-                                    FocusLocalTrayWindow();
-
-                                    if (_trayMenuWindow != null)
-                                    {
-                                        _trayMenuWindow.Dispatcher.BeginInvoke(new Action(() =>
+                                        // If already at the first/last virtual desktop and not mid-switch session,
+                                        // keep focus inside the remote desktop window while showing the boundary bounce!
+                                        if (atBoundary && !_inDesktopSwitchSession)
                                         {
-                                            TriggerLocalVirtualDesktopSwitch(arrowByte);
-                                        }));
-                                    }
-                                }
+                                            return (IntPtr)1;
+                                        }
 
-                                return (IntPtr)1;
+                                        _physWinDown = true;
+                                        _physCtrlDown = true;
+                                        _inDesktopSwitchSession = true;
+                                        _desktopSwitchEndTimer?.Stop();
+                                        if (_desktopSwitchSafetyTimer != null)
+                                        {
+                                            _desktopSwitchSafetyTimer.Stop();
+                                            _desktopSwitchSafetyTimer.Start();
+                                        }
+
+                                        byte arrowByte = (byte)vkCode;
+                                        if (currentFg != IntPtr.Zero && IsWindowTargetProcess(currentFg))
+                                        {
+                                            _desktopSwitchSourceHwnd = currentFg;
+                                        }
+                                        else if (_desktopSwitchSourceHwnd == IntPtr.Zero && IsWindowTargetProcess(_lastExternalForegroundHwnd))
+                                        {
+                                            _desktopSwitchSourceHwnd = _lastExternalForegroundHwnd;
+                                        }
+
+                                        FocusLocalTrayWindow();
+
+                                        if (_trayMenuWindow != null)
+                                        {
+                                            _trayMenuWindow.Dispatcher.BeginInvoke(new Action(() =>
+                                            {
+                                                TriggerLocalVirtualDesktopSwitch(arrowByte);
+                                            }));
+                                        }
+                                    }
+
+                                    return (IntPtr)1;
+                                }
                             }
                         }
                     }
@@ -2302,7 +2332,7 @@ namespace FluentOsdPro
 
         private static void TriggerLocalVirtualDesktopSwitch(byte arrowVk)
         {
-            long now = Environment.TickCount & Int32.MaxValue;
+            long now = MonotonicTickMs();
             if (now - _lastDesktopSwitchTick < 90)
             {
                 return;

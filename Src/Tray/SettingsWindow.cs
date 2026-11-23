@@ -8,6 +8,7 @@ using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Shapes;
+using System.Windows.Threading;
 
 namespace FluentOsdPro
 {
@@ -26,9 +27,27 @@ namespace FluentOsdPro
         private const int DwmwaUseImmersiveDarkMode = 20;
         private const int DwmwaWindowCornerPreference = 33;
         private const int DwmwcpRound = 2;
+        private const int WmDisplayChange = 0x007E;
+        private const int WmDpiChanged = 0x02E0;
+        private const uint SwpNoSize = 0x0001;
+        private const uint SwpNoZOrder = 0x0004;
+        private const uint SwpNoActivate = 0x0010;
 
         [DllImport("dwmapi.dll")]
         private static extern int DwmSetWindowAttribute(IntPtr hwnd, int dwAttribute, ref int pvAttribute, int cbAttribute);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetWindowPos(
+            IntPtr hWnd,
+            IntPtr hWndInsertAfter,
+            int X,
+            int Y,
+            int cx,
+            int cy,
+            uint uFlags);
+
+        private readonly DispatcherTimer _saveDebounceTimer;
 
         private CheckBox _guardToggle;
         private CheckBox _autoStartToggle;
@@ -56,6 +75,16 @@ namespace FluentOsdPro
             UseLayoutRounding = true;
             SnapsToDevicePixels = true;
 
+            _saveDebounceTimer = new DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(250)
+            };
+            _saveDebounceTimer.Tick += (s, e) =>
+            {
+                _saveDebounceTimer.Stop();
+                AppSettings.Current.Save();
+            };
+
             BuildUi();
             Loaded += (s, e) =>
             {
@@ -63,41 +92,87 @@ namespace FluentOsdPro
             };
         }
 
+        protected override void OnClosing(System.ComponentModel.CancelEventArgs e)
+        {
+            if (_saveDebounceTimer.IsEnabled)
+            {
+                _saveDebounceTimer.Stop();
+                AppSettings.Current.Save();
+            }
+            base.OnClosing(e);
+        }
+
+        public void RefreshThemeAndLanguage()
+        {
+            bool nowZh = ThemeService.IsSystemChinese();
+            Title = nowZh ? "Fluent OSD Pro - 设置" : "Fluent OSD Pro - Settings";
+            IntPtr hwnd = new WindowInteropHelper(this).Handle;
+            if (hwnd != IntPtr.Zero)
+            {
+                int dark = ThemeService.IsSystemDarkTheme() ? 1 : 0;
+                DwmSetWindowAttribute(hwnd, DwmwaUseImmersiveDarkMode, ref dark, sizeof(int));
+            }
+            BuildUi();
+        }
+
+        private void UpdateMaxHeightForCurrentMonitor()
+        {
+            try
+            {
+                System.Drawing.Point pt = System.Windows.Forms.Cursor.Position;
+                OsdPlacementService.GetMonitorGeometryFromPhysicalPoint(
+                    pt.X,
+                    pt.Y,
+                    out _,
+                    out OsdPlacementService.Win32Rect waPx,
+                    out _,
+                    out double dpiY);
+                double waHeightDip = Math.Max(420.0, ((waPx.Bottom - waPx.Top) / dpiY) - 32.0);
+                MaxHeight = waHeightDip;
+            }
+            catch
+            {
+            }
+        }
+
         public void CenterOnActiveMonitorAndBringToFront()
         {
             try
             {
                 System.Drawing.Point pt = System.Windows.Forms.Cursor.Position;
-                System.Windows.Forms.Screen screen = System.Windows.Forms.Screen.FromPoint(pt);
-                System.Drawing.Rectangle wa = screen.WorkingArea;
+                OsdPlacementService.GetMonitorGeometryFromPhysicalPoint(
+                    pt.X,
+                    pt.Y,
+                    out _,
+                    out OsdPlacementService.Win32Rect waPx,
+                    out double dpiX,
+                    out double dpiY);
 
-                double dpiX = 1.0;
-                double dpiY = 1.0;
-                PresentationSource source = PresentationSource.FromVisual(this);
-                if (source?.CompositionTarget != null)
+                double waHeightDip = Math.Max(420.0, ((waPx.Bottom - waPx.Top) / dpiY) - 32.0);
+                MaxHeight = waHeightDip;
+                UpdateLayout();
+
+                double w = ActualWidth > 0 ? ActualWidth : Width;
+                double h = ActualHeight > 0 ? ActualHeight : Math.Min(540.0, waHeightDip);
+
+                int wPx = Math.Max(1, (int)Math.Round(w * dpiX));
+                int hPx = Math.Max(1, (int)Math.Round(h * dpiY));
+                int waWidthPx = Math.Max(1, waPx.Right - waPx.Left);
+                int waHeightPx = Math.Max(1, waPx.Bottom - waPx.Top);
+
+                int targetLeftPx = waPx.Left + Math.Max(0, (waWidthPx - wPx) / 2);
+                int targetTopPx = waPx.Top + Math.Max(0, (waHeightPx - hPx) / 2);
+
+                IntPtr hwnd = new WindowInteropHelper(this).Handle;
+                if (hwnd != IntPtr.Zero)
                 {
-                    dpiX = source.CompositionTarget.TransformToDevice.M11;
-                    dpiY = source.CompositionTarget.TransformToDevice.M22;
+                    SetWindowPos(hwnd, IntPtr.Zero, targetLeftPx, targetTopPx, 0, 0, SwpNoSize | SwpNoZOrder | SwpNoActivate);
                 }
                 else
                 {
-                    using (System.Drawing.Graphics g = System.Drawing.Graphics.FromHwnd(IntPtr.Zero))
-                    {
-                        dpiX = g.DpiX / 96.0;
-                        dpiY = g.DpiY / 96.0;
-                    }
+                    Left = targetLeftPx / dpiX;
+                    Top = targetTopPx / dpiY;
                 }
-
-                double waLeft = wa.Left / dpiX;
-                double waTop = wa.Top / dpiY;
-                double waWidth = wa.Width / dpiX;
-                double waHeight = wa.Height / dpiY;
-
-                double w = ActualWidth > 0 ? ActualWidth : Width;
-                double h = ActualHeight > 0 ? ActualHeight : 540;
-
-                Left = waLeft + Math.Max(0, (waWidth - w) / 2.0);
-                Top = waTop + Math.Max(0, (waHeight - h) / 2.0);
 
                 Topmost = true;
                 Activate();
@@ -120,6 +195,9 @@ namespace FluentOsdPro
                 IntPtr hwnd = new WindowInteropHelper(this).Handle;
                 if (hwnd != IntPtr.Zero)
                 {
+                    HwndSource source = HwndSource.FromHwnd(hwnd);
+                    source?.AddHook(SettingsWindowHook);
+
                     int dark = ThemeService.IsSystemDarkTheme() ? 1 : 0;
                     DwmSetWindowAttribute(hwnd, DwmwaUseImmersiveDarkMode, ref dark, sizeof(int));
                     if (Environment.OSVersion.Version.Build >= 22000)
@@ -132,6 +210,18 @@ namespace FluentOsdPro
             catch
             {
             }
+        }
+
+        private IntPtr SettingsWindowHook(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+        {
+            if (msg == WmDisplayChange || msg == WmDpiChanged)
+            {
+                Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() =>
+                {
+                    UpdateMaxHeightForCurrentMonitor();
+                }));
+            }
+            return IntPtr.Zero;
         }
 
         public void SyncFromCurrentSettings()
@@ -380,7 +470,8 @@ namespace FluentOsdPro
                 if (AppSettings.Current.OsdTransparency != val)
                 {
                     AppSettings.Current.OsdTransparency = val;
-                    AppSettings.Current.Save();
+                    _saveDebounceTimer.Stop();
+                    _saveDebounceTimer.Start();
                     TaskbarMicaSync.NotifyTransparencyChanged();
                     Program.ShowImePreview(0);
                 }
@@ -620,6 +711,7 @@ namespace FluentOsdPro
                     AppSettings.Current.Save();
                     bool nowZh = ThemeService.IsSystemChinese();
                     Title = nowZh ? "Fluent OSD Pro - 设置" : "Fluent OSD Pro - Settings";
+                    Program.RefreshTrayMenuAndTooltip();
                     BuildUi();
                     Program.ShowImePreview(0);
                 }
@@ -674,7 +766,14 @@ namespace FluentOsdPro
             previewRow.Children.Add(btnPreviewVol);
 
             root.Children.Add(previewRow);
-            Content = root;
+            ScrollViewer scrollViewer = new ScrollViewer
+            {
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+                PanningMode = PanningMode.VerticalOnly,
+                Content = root
+            };
+            Content = scrollViewer;
 
             SyncFromCurrentSettings();
         }

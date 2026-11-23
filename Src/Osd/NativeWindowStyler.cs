@@ -10,6 +10,14 @@ namespace FluentOsdPro
         private const int WsExNoActivate = 0x08000000;
         private const int WsExTransparent = 0x00000020;
 
+        private const uint SwpNoSize = 0x0001;
+        private const uint SwpNoMove = 0x0002;
+        private const uint SwpNoZOrder = 0x0004;
+        private const uint SwpNoActivate = 0x0010;
+        private const uint SwpFrameChanged = 0x0020;
+        private const uint SwpNoOwnerZOrder = 0x0200;
+        private const uint SwpNoSendChanging = 0x0400;
+
         private const int DwmwaUseImmersiveDarkMode = 20;
         private const int DwmwaWindowCornerPreference = 33;
         private const int DwmwaBorderColor = 34;
@@ -68,7 +76,23 @@ namespace FluentOsdPro
         [DllImport("user32.dll")]
         private static extern int SetWindowCompositionAttribute(IntPtr hwnd, ref WindowCompositionAttributeData data);
 
-        public static void ApplyOsdWindowStyle(IntPtr hwnd, bool isDarkTheme, bool enableAcrylic, bool clickThrough = true)
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetWindowPos(
+            IntPtr hWnd,
+            IntPtr hWndInsertAfter,
+            int X,
+            int Y,
+            int cx,
+            int cy,
+            uint uFlags);
+
+        public static void ApplyOsdWindowStyle(
+            IntPtr hwnd,
+            bool isDarkTheme,
+            bool enableAcrylic,
+            bool clickThrough = true,
+            bool forceResetAccent = false)
         {
             if (hwnd == IntPtr.Zero)
             {
@@ -101,14 +125,26 @@ namespace FluentOsdPro
                 int dark = isDarkTheme ? 1 : 0;
                 DwmSetWindowAttribute(hwnd, DwmwaUseImmersiveDarkMode, ref dark, sizeof(int));
 
-                ApplyAcrylicBlur(hwnd, isDarkTheme, enableAcrylic);
+                ApplyAcrylicBlur(hwnd, isDarkTheme, enableAcrylic, forceResetAccent);
+
+                if (forceResetAccent)
+                {
+                    SetWindowPos(
+                        hwnd,
+                        IntPtr.Zero,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SwpNoMove | SwpNoSize | SwpNoZOrder | SwpNoOwnerZOrder | SwpNoActivate | SwpFrameChanged | SwpNoSendChanging);
+                }
             }
             catch
             {
             }
         }
 
-        public static void ApplyAcrylicBlur(IntPtr hwnd, bool isDarkTheme, bool enableAcrylic)
+        public static void ApplyAcrylicBlur(IntPtr hwnd, bool isDarkTheme, bool enableAcrylic, bool forceReset = false)
         {
             if (hwnd == IntPtr.Zero)
             {
@@ -126,6 +162,18 @@ namespace FluentOsdPro
                 tint = ((uint)mica.B << 16) | ((uint)mica.G << 8) | mica.R;
             }
 
+            if (forceReset && enableAcrylic)
+            {
+                // Toggle Disabled (0) -> EnableAcrylicBlurBehind (4) so uDWM never skips recreating
+                // an invalidated CAcrylicSheet visual after display rotation / mode switches.
+                SetAccentPolicyCore(hwnd, new AccentPolicy
+                {
+                    AccentState = (int)AccentState.Disabled,
+                    AccentFlags = 0,
+                    GradientColor = 0
+                });
+            }
+
             AccentPolicy accent = new AccentPolicy
             {
                 AccentState = enableAcrylic
@@ -135,6 +183,11 @@ namespace FluentOsdPro
                 GradientColor = unchecked((int)((alpha << 24) | tint))
             };
 
+            SetAccentPolicyCore(hwnd, accent);
+        }
+
+        private static void SetAccentPolicyCore(IntPtr hwnd, AccentPolicy accent)
+        {
             int size = Marshal.SizeOf(accent);
             IntPtr ptr = Marshal.AllocHGlobal(size);
             try

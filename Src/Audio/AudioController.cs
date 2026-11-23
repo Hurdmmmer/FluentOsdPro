@@ -37,8 +37,8 @@ namespace FluentOsdPro
         private static bool _busy;
         private static bool _pending;
         private static bool _pendingNext;
-        private static long _lastNextSwitchTick;
-        private static long _lastPrevSwitchTick;
+        private static long _lastNextSwitchTick = -10000L;
+        private static long _lastPrevSwitchTick = -10000L;
 
         public static void Init(Action<AudioVolumeController.VolumeState> onSwitched)
         {
@@ -47,7 +47,7 @@ namespace FluentOsdPro
 
         public static void TriggerSwitch(bool next)
         {
-            long now = Environment.TickCount & Int32.MaxValue;
+            long now = Program.MonotonicTickMs();
             long last = next ? _lastNextSwitchTick : _lastPrevSwitchTick;
             if (now - last < MinSameDirectionIntervalMs)
             {
@@ -207,7 +207,7 @@ namespace FluentOsdPro
                             {
                                 newName = devices[targetIndex].DisplayName;
                             }
-                            _lastProgrammaticSwitchTick = Environment.TickCount & Int32.MaxValue;
+                            _lastProgrammaticSwitchTick = Program.MonotonicTickMs();
                             UpdateCachedDefaultDeviceName(newName);
                             AudioVolumeController.NotifyDefaultEndpointSwitchedProgrammatically();
                             return new SwitchResult
@@ -392,15 +392,15 @@ namespace FluentOsdPro
         }
 
         private static string _cachedDefaultDeviceName = string.Empty;
-        private static long _cachedDefaultDeviceTick;
-        private static long _lastProgrammaticSwitchTick;
+        private static long _cachedDefaultDeviceTick = -10000L;
+        private static long _lastProgrammaticSwitchTick = -10000L;
 
         public static long LastProgrammaticSwitchTick => _lastProgrammaticSwitchTick;
 
         public static void InvalidateDefaultDeviceCache()
         {
             _cachedDefaultDeviceName = string.Empty;
-            _cachedDefaultDeviceTick = 0;
+            _cachedDefaultDeviceTick = -10000L;
         }
 
         private static void UpdateCachedDefaultDeviceName(string name)
@@ -408,13 +408,13 @@ namespace FluentOsdPro
             if (!string.IsNullOrEmpty(name))
             {
                 _cachedDefaultDeviceName = name;
-                _cachedDefaultDeviceTick = Environment.TickCount & Int32.MaxValue;
+                _cachedDefaultDeviceTick = Program.MonotonicTickMs();
             }
         }
 
         public static string GetDefaultDeviceDisplayName()
         {
-            long now = Environment.TickCount & Int32.MaxValue;
+            long now = Program.MonotonicTickMs();
             string cached = _cachedDefaultDeviceName;
             if (!string.IsNullOrEmpty(cached) && (now - _cachedDefaultDeviceTick) >= 0 && (now - _cachedDefaultDeviceTick) < 1500)
             {
@@ -769,7 +769,7 @@ namespace FluentOsdPro
         private static string _subscribedDeviceId = string.Empty;
         private static int _lastNotifiedPercent = -1;
         private static bool? _lastNotifiedMuted;
-        private static long _lastRebindTick;
+        private static long _lastRebindTick = -10000L;
 
         public sealed class VolumeState
         {
@@ -875,7 +875,7 @@ namespace FluentOsdPro
 
                     _lastNotifiedPercent = (int)Math.Round(level * 100.0f);
                     _lastNotifiedMuted = muted;
-                    _lastRebindTick = Environment.TickCount & Int32.MaxValue;
+                    _lastRebindTick = Program.MonotonicTickMs();
 
                     _volumeCallback = new EndpointVolumeCallback();
                     int hr = vol.RegisterControlChangeNotify(_volumeCallback);
@@ -947,7 +947,7 @@ namespace FluentOsdPro
             string devName;
             lock (VolumeLock)
             {
-                long now = Environment.TickCount & Int32.MaxValue;
+                long now = Program.MonotonicTickMs();
                 bool inConnectGracePeriod = (now - _lastRebindTick) >= 0 && (now - _lastRebindTick) < 1800;
                 if (inConnectGracePeriod)
                 {
@@ -1270,7 +1270,7 @@ namespace FluentOsdPro
                 }
 
                 string newId = pwstrDefaultDeviceId ?? string.Empty;
-                long now = Environment.TickCount & Int32.MaxValue;
+                long now = Program.MonotonicTickMs();
                 lock (VolumeLock)
                 {
                     if (string.Equals(_subscribedDeviceId, newId, StringComparison.OrdinalIgnoreCase) &&

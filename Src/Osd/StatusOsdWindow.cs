@@ -37,11 +37,13 @@ namespace FluentOsdPro
         private const int WmMouseActivate = 0x0021;
         private const int WmEraseBkgnd = 0x0014;
         private const int WmDisplayChange = 0x007E;
+        private const int WmDpiChanged = 0x02E0;
         private const int WmPowerBroadcast = 0x0218;
         private const int WmSettingChange = 0x001A;
         private const int WmThemeChanged = 0x031A;
         private const int WmDwmCompositionChanged = 0x031E;
         private const int WmDwmColorizationColorChanged = 0x0320;
+        private static readonly int[] DisplayRecoveryDelaysMs = new[] { 90, 260, 550 };
         private const int GclpHbrBackground = -10;
         private const int MaNoActivate = 3;
         private const int SwHide = 0;
@@ -123,12 +125,15 @@ namespace FluentOsdPro
 
         private readonly DispatcherTimer _hideTimer;
         private readonly DispatcherTimer _motionTimer;
+        private readonly DispatcherTimer _displayRecoveryTimer;
 
         private IntPtr _hwnd = IntPtr.Zero;
         private HwndSource _hwndSource;
         private bool _prewarmed;
         private bool _allowClose;
         private bool _highPrecisionTimerEnabled;
+        private bool _needsForceRestyle;
+        private int _displayRecoveryStep;
 
         private OsdVisualMode _lastVisualMode = OsdVisualMode.None;
         private bool? _lastStateEnabled;
@@ -242,6 +247,9 @@ namespace FluentOsdPro
                 Interval = TimeSpan.FromMilliseconds(MotionFrameIntervalMs)
             };
             _motionTimer.Tick += OnMotionTimerTick;
+
+            _displayRecoveryTimer = new DispatcherTimer(DispatcherPriority.Render);
+            _displayRecoveryTimer.Tick += OnDisplayRecoveryTimerTick;
         }
 
         public bool IsCurrentlyVisible =>
@@ -413,22 +421,15 @@ namespace FluentOsdPro
             }
 
             if (msg == WmDisplayChange ||
+                msg == WmDpiChanged ||
                 msg == WmPowerBroadcast ||
                 msg == WmDwmCompositionChanged)
             {
                 _lastAppliedDark = null;
                 _lastAppliedAcrylic = null;
-                Dispatcher.BeginInvoke(new Action(() =>
-                {
-                    if (_hwnd != IntPtr.Zero)
-                    {
-                        ApplyCurrentTheme(force: true);
-                        if (IsVisible)
-                        {
-                            InvalidateVisual();
-                        }
-                    }
-                }), DispatcherPriority.Background);
+                _needsForceRestyle = true;
+                TaskbarMicaSync.NotifySettingChange();
+                ScheduleDisplayRecovery();
             }
             else if (msg == WmSettingChange ||
                      msg == WmThemeChanged ||
@@ -439,6 +440,7 @@ namespace FluentOsdPro
                 {
                     if (_hwnd != IntPtr.Zero)
                     {
+                        ThemeService.RefreshThemeCache();
                         TaskbarMicaSync.RefreshIfNeeded();
                         ApplyCurrentTheme(force: false);
                     }
@@ -446,6 +448,54 @@ namespace FluentOsdPro
             }
 
             return IntPtr.Zero;
+        }
+
+        private void ScheduleDisplayRecovery()
+        {
+            _displayRecoveryStep = 0;
+            _displayRecoveryTimer.Stop();
+            _displayRecoveryTimer.Interval = TimeSpan.FromMilliseconds(DisplayRecoveryDelaysMs[0]);
+            _displayRecoveryTimer.Start();
+
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                RecoverFromDisplayOrDwmChange();
+            }), DispatcherPriority.Render);
+        }
+
+        private void OnDisplayRecoveryTimerTick(object sender, EventArgs e)
+        {
+            _displayRecoveryTimer.Stop();
+            RecoverFromDisplayOrDwmChange();
+
+            _displayRecoveryStep++;
+            if (_displayRecoveryStep < DisplayRecoveryDelaysMs.Length)
+            {
+                int prevMs = DisplayRecoveryDelaysMs[_displayRecoveryStep - 1];
+                int nextDeltaMs = Math.Max(40, DisplayRecoveryDelaysMs[_displayRecoveryStep] - prevMs);
+                _displayRecoveryTimer.Interval = TimeSpan.FromMilliseconds(nextDeltaMs);
+                _displayRecoveryTimer.Start();
+            }
+        }
+
+        private void RecoverFromDisplayOrDwmChange()
+        {
+            if (_hwnd == IntPtr.Zero)
+            {
+                return;
+            }
+
+            ThemeService.RefreshThemeCache();
+            TaskbarMicaSync.RefreshIfNeeded();
+            _needsForceRestyle = false;
+            ApplyCurrentTheme(force: true, forceResetAccent: true);
+
+            if (IsCurrentlyVisible)
+            {
+                RepositionIfStackedAboveVolume();
+                InvalidateVisual();
+                UpdateLayout();
+            }
         }
 
         protected override void OnClosing(System.ComponentModel.CancelEventArgs e)
@@ -457,6 +507,7 @@ namespace FluentOsdPro
             }
 
             _hideTimer.Stop();
+            _displayRecoveryTimer.Stop();
             StopMotionLoop();
             if (_hwndSource != null)
             {
@@ -604,7 +655,9 @@ namespace FluentOsdPro
             _iconText.Visibility = isLock ? Visibility.Collapsed : Visibility.Visible;
 
             // Update theme & wallpaper Mica/accent brushes BEFORE AnimateState -> ApplyBadgeColors
-            ApplyCurrentTheme(force: !wasVisible);
+            bool forceStyle = !wasVisible || _needsForceRestyle;
+            _needsForceRestyle = false;
+            ApplyCurrentTheme(force: forceStyle, forceResetAccent: forceStyle);
 
             // Evaluate state & label transitions BEFORE overwriting _last* fields so in-place switching animations fire properly
             AnimateState(visualMode, isEnabled, badgeGlyph, animStyle, animate && wasVisible);
@@ -670,18 +723,18 @@ namespace FluentOsdPro
         private Color _lastAppliedAccent;
         private long _lastMicaSignature = -1;
 
-        private void ApplyCurrentTheme(bool force = false)
+        private void ApplyCurrentTheme(bool force = false, bool forceResetAccent = false)
         {
             bool isDark = ThemeService.IsSystemDarkTheme();
             bool isLight = !isDark;
             bool enableAcrylic = ThemeService.IsSystemTransparencyEnabled();
-            bool syncWallpaperColor = AppSettings.Current.WallpaperColorSyncEnabled;
-            Color accentColor = syncWallpaperColor
-                ? ThemeService.GetAccentColor()
-                : (isLight ? Color.FromArgb(0xEB, 0x18, 0x18, 0x1B) : Color.FromArgb(0xF2, 0xF5, 0xF6, 0xF8));
+            // FluentOsdPro's own OSD flyouts always use dynamic wallpaper-derived Mica & accent colors;
+            // WallpaperColorSyncEnabled independently controls syncing to Microsoft Pinyin IME.
+            Color accentColor = ThemeService.GetAccentColor();
             long micaSignature = TaskbarMicaSync.Signature;
 
             if (!force &&
+                !forceResetAccent &&
                 _lastMicaSignature == micaSignature &&
                 _lastAppliedAccent == accentColor &&
                 _lastAppliedDark.HasValue && _lastAppliedDark.Value == isDark &&
@@ -721,6 +774,7 @@ namespace FluentOsdPro
 
             if (_hwnd != IntPtr.Zero &&
                 (force ||
+                 forceResetAccent ||
                  _lastMicaSignature != micaSignature ||
                  !_lastAppliedDark.HasValue || _lastAppliedDark.Value != isDark ||
                  !_lastAppliedAcrylic.HasValue || _lastAppliedAcrylic.Value != enableAcrylic))
@@ -728,7 +782,12 @@ namespace FluentOsdPro
                 _lastAppliedDark = isDark;
                 _lastAppliedAcrylic = enableAcrylic;
                 _lastMicaSignature = micaSignature;
-                NativeWindowStyler.ApplyOsdWindowStyle(_hwnd, isDark, enableAcrylic, clickThrough: false);
+                NativeWindowStyler.ApplyOsdWindowStyle(
+                    _hwnd,
+                    isDark,
+                    enableAcrylic,
+                    clickThrough: false,
+                    forceResetAccent: forceResetAccent);
             }
         }
 
@@ -1385,7 +1444,7 @@ namespace FluentOsdPro
                 {
                     SetWindowPos(_hwnd, HwndTopMost, -32000, -32000, wPx, hPx, SwpNoActivate | SwpNoOwnerZOrder | SwpNoSendChanging);
                     ShowWindow(_hwnd, SwShowNoActivate);
-                    ApplyCurrentTheme(force: true);
+                    ApplyCurrentTheme(force: true, forceResetAccent: true);
                     InvalidateVisual();
                     UpdateLayout();
                     try

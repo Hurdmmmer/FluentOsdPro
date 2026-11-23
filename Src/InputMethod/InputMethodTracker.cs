@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
 
 namespace FluentOsdPro
 {
@@ -8,14 +9,18 @@ namespace FluentOsdPro
         public const int DefaultWindowQuietMilliseconds = 350;
         public const int DefaultKeyGateMilliseconds = 950;
 
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool IsWindow(IntPtr hWnd);
+
         private readonly int _windowQuietMilliseconds;
         private readonly Dictionary<IntPtr, int> _lastLangIdByWindow = new Dictionary<IntPtr, int>();
         private InputMethodSnapshot _baseline;
         private InputMethodSnapshot _lastEmittedSnapshot;
-        private long _lastEmittedTick;
+        private long _lastEmittedTick = -10000L;
         private IntPtr _quietWindowHandle;
-        private long _quietUntilTick;
-        private long _keyGateUntilTick;
+        private long _quietUntilTick = -10000L;
+        private long _keyGateUntilTick = -10000L;
 
         public InputMethodTracker(int windowQuietMilliseconds = DefaultWindowQuietMilliseconds)
         {
@@ -91,6 +96,10 @@ namespace FluentOsdPro
 
             if (snapshot.Known && snapshot.WindowHandle != IntPtr.Zero)
             {
+                if (!_lastLangIdByWindow.ContainsKey(snapshot.WindowHandle) && _lastLangIdByWindow.Count >= 64)
+                {
+                    PruneStaleWindowEntries();
+                }
                 _lastLangIdByWindow[snapshot.WindowHandle] = snapshot.LangId;
             }
 
@@ -161,6 +170,32 @@ namespace FluentOsdPro
             _lastEmittedSnapshot = snapshot;
             _lastEmittedTick = nowTick;
             return snapshot;
+        }
+
+        private void PruneStaleWindowEntries()
+        {
+            List<IntPtr> deadKeys = null;
+            foreach (KeyValuePair<IntPtr, int> kv in _lastLangIdByWindow)
+            {
+                if (kv.Key == IntPtr.Zero || !IsWindow(kv.Key))
+                {
+                    if (deadKeys == null) deadKeys = new List<IntPtr>();
+                    deadKeys.Add(kv.Key);
+                }
+            }
+
+            if (deadKeys != null)
+            {
+                for (int i = 0; i < deadKeys.Count; i++)
+                {
+                    _lastLangIdByWindow.Remove(deadKeys[i]);
+                }
+            }
+
+            if (_lastLangIdByWindow.Count > 128)
+            {
+                _lastLangIdByWindow.Clear();
+            }
         }
     }
 }

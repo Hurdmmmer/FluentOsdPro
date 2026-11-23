@@ -1,7 +1,9 @@
 using System;
+using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Effects;
 using Forms = System.Windows.Forms;
@@ -35,6 +37,22 @@ namespace FluentOsdPro
         private Brush _rowHoverBrush;
         private Brush _rowPressedBrush;
         private bool _isClosing;
+
+        private const uint SwpNoSize = 0x0001;
+        private const uint SwpNoZOrder = 0x0004;
+        private const uint SwpNoActivate = 0x0010;
+        private const uint SwpNoSendChanging = 0x0400;
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetWindowPos(
+            IntPtr hWnd,
+            IntPtr hWndInsertAfter,
+            int X,
+            int Y,
+            int cx,
+            int cy,
+            uint uFlags);
 
         public TrayMenuPopupWindow()
         {
@@ -266,24 +284,26 @@ namespace FluentOsdPro
             RefreshMenu();
 
             Forms.Cursor.Position.Deconstruct(out int cursorX, out int cursorY);
-            Forms.Screen screen = Forms.Screen.FromPoint(new System.Drawing.Point(cursorX, cursorY));
-            System.Drawing.Rectangle workArea = screen.WorkingArea;
+            OsdPlacementService.GetMonitorGeometryFromPhysicalPoint(
+                cursorX,
+                cursorY,
+                out OsdPlacementService.Win32Rect bounds,
+                out OsdPlacementService.Win32Rect workArea,
+                out double dpiX,
+                out double dpiY);
 
-            double dpiX = 1.0;
-            double dpiY = 1.0;
-            PresentationSource source = PresentationSource.FromVisual(this);
-            if (source?.CompositionTarget != null)
+            IntPtr hwnd = new WindowInteropHelper(this).EnsureHandle();
+            if (hwnd != IntPtr.Zero && !IsVisible)
             {
-                dpiX = source.CompositionTarget.TransformToDevice.M11;
-                dpiY = source.CompositionTarget.TransformToDevice.M22;
-            }
-            else
-            {
-                using (System.Drawing.Graphics g = System.Drawing.Graphics.FromHwnd(IntPtr.Zero))
-                {
-                    dpiX = g.DpiX / 96.0;
-                    dpiY = g.DpiY / 96.0;
-                }
+                // Pre-place onto target monitor before Show/UpdateLayout so PerMonitorV2 scales ActualWidth/Height cleanly
+                SetWindowPos(
+                    hwnd,
+                    IntPtr.Zero,
+                    workArea.Left,
+                    workArea.Top,
+                    0,
+                    0,
+                    SwpNoSize | SwpNoZOrder | SwpNoActivate | SwpNoSendChanging);
             }
 
             Show();
@@ -291,67 +311,66 @@ namespace FluentOsdPro
 
             double menuW = ActualWidth > 0 ? ActualWidth : Width;
             double menuH = ActualHeight > 0 ? ActualHeight : 165;
-
-            double curDipX = cursorX / dpiX;
-            double curDipY = cursorY / dpiY;
-            double waLeft = workArea.Left / dpiX;
-            double waTop = workArea.Top / dpiY;
-            double waRight = workArea.Right / dpiX;
-            double waBottom = workArea.Bottom / dpiY;
-
-            System.Drawing.Rectangle bounds = screen.Bounds;
-            double scrLeft = bounds.Left / dpiX;
-            double scrTop = bounds.Top / dpiY;
-            double scrRight = bounds.Right / dpiX;
-            double scrBottom = bounds.Bottom / dpiY;
+            int menuWPx = Math.Max(1, (int)Math.Round(menuW * dpiX));
+            int menuHPx = Math.Max(1, (int)Math.Round(menuH * dpiY));
+            int margin4Px = Math.Max(2, (int)Math.Round(4.0 * dpiX));
+            int gap6Px = Math.Max(3, (int)Math.Round(6.0 * dpiY));
+            int gap10Px = Math.Max(4, (int)Math.Round(10.0 * dpiX));
+            int offset18Px = (int)Math.Round(18.0 * dpiX);
+            int edgeThresholdPx = (int)Math.Round(96.0 * Math.Max(dpiX, dpiY));
 
             // Detect which of the 4 edges (Left / Top / Right / Bottom) the cursor/taskbar is near
-            double distLeft = Math.Abs(curDipX - scrLeft);
-            double distRight = Math.Abs(scrRight - curDipX);
-            double distTop = Math.Abs(curDipY - scrTop);
-            double distBottom = Math.Abs(scrBottom - curDipY);
-            double minHoriz = Math.Min(distLeft, distRight);
-            double minVert = Math.Min(distTop, distBottom);
+            int distLeft = Math.Abs(cursorX - bounds.Left);
+            int distRight = Math.Abs(bounds.Right - cursorX);
+            int distTop = Math.Abs(cursorY - bounds.Top);
+            int distBottom = Math.Abs(bounds.Bottom - cursorY);
+            int minHoriz = Math.Min(distLeft, distRight);
+            int minVert = Math.Min(distTop, distBottom);
 
-            double targetLeft;
-            double targetTop;
+            int targetLeftPx;
+            int targetTopPx;
 
-            if (minHoriz < minVert && minHoriz < 96)
+            if (minHoriz < minVert && minHoriz < edgeThresholdPx)
             {
                 // Vertical taskbar on Right or Left edge
                 if (distRight <= distLeft)
                 {
-                    // Right-side taskbar: place popup menu to the left of the cursor/taskbar
-                    double rightLimit = Math.Min(waRight - 4, curDipX - 10);
-                    targetLeft = rightLimit - menuW;
+                    int rightLimit = Math.Min(workArea.Right - margin4Px, cursorX - gap10Px);
+                    targetLeftPx = rightLimit - menuWPx;
                 }
                 else
                 {
-                    // Left-side taskbar: place popup menu to the right of the cursor/taskbar
-                    targetLeft = Math.Max(waLeft + 4, curDipX + 10);
+                    targetLeftPx = Math.Max(workArea.Left + margin4Px, cursorX + gap10Px);
                 }
-                targetTop = curDipY - (menuH * 0.5);
+                targetTopPx = cursorY - (menuHPx / 2);
             }
-            else if (distTop < distBottom && distTop < 96)
+            else if (distTop < distBottom && distTop < edgeThresholdPx)
             {
                 // Top-edge taskbar: place popup menu below the cursor/taskbar
-                targetLeft = curDipX - menuW + 18;
-                targetTop = Math.Max(waTop + 4, curDipY + 10);
+                targetLeftPx = cursorX - menuWPx + offset18Px;
+                targetTopPx = Math.Max(workArea.Top + margin4Px, cursorY + gap10Px);
             }
             else
             {
                 // Bottom-edge taskbar (default): place popup menu above the cursor/taskbar
-                targetLeft = curDipX - menuW + 18;
-                targetTop = curDipY - menuH - 6;
+                targetLeftPx = cursorX - menuWPx + offset18Px;
+                targetTopPx = cursorY - menuHPx - gap6Px;
             }
 
-            if (targetLeft < waLeft + 4) targetLeft = waLeft + 4;
-            if (targetLeft + menuW > waRight - 4) targetLeft = waRight - menuW - 4;
-            if (targetTop < waTop + 4) targetTop = waTop + 4;
-            if (targetTop + menuH > waBottom - 4) targetTop = waBottom - menuH - 4;
+            if (targetLeftPx < workArea.Left + margin4Px) targetLeftPx = workArea.Left + margin4Px;
+            if (targetLeftPx + menuWPx > workArea.Right - margin4Px) targetLeftPx = workArea.Right - menuWPx - margin4Px;
+            if (targetTopPx < workArea.Top + margin4Px) targetTopPx = workArea.Top + margin4Px;
+            if (targetTopPx + menuHPx > workArea.Bottom - margin4Px) targetTopPx = workArea.Bottom - menuHPx - margin4Px;
 
-            Left = targetLeft;
-            Top = targetTop;
+            if (hwnd != IntPtr.Zero)
+            {
+                SetWindowPos(hwnd, IntPtr.Zero, targetLeftPx, targetTopPx, 0, 0, SwpNoSize | SwpNoZOrder | SwpNoActivate);
+            }
+            else
+            {
+                Left = targetLeftPx / dpiX;
+                Top = targetTopPx / dpiY;
+            }
             Activate();
         }
     }

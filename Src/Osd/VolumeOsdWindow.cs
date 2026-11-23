@@ -32,11 +32,13 @@ namespace FluentOsdPro
         private const int WmMouseActivate = 0x0021;
         private const int WmEraseBkgnd = 0x0014;
         private const int WmDisplayChange = 0x007E;
+        private const int WmDpiChanged = 0x02E0;
         private const int WmPowerBroadcast = 0x0218;
         private const int WmSettingChange = 0x001A;
         private const int WmThemeChanged = 0x031A;
         private const int WmDwmCompositionChanged = 0x031E;
         private const int WmDwmColorizationColorChanged = 0x0320;
+        private static readonly int[] DisplayRecoveryDelaysMs = new[] { 90, 260, 550 };
         private const int GclpHbrBackground = -10;
         private const int MaNoActivate = 3;
         private const int SwHide = 0;
@@ -135,11 +137,14 @@ namespace FluentOsdPro
         private readonly TextBlock _volumeValueBlock;
         private readonly DispatcherTimer _hideTimer;
         private readonly DispatcherTimer _motionTimer;
+        private readonly DispatcherTimer _displayRecoveryTimer;
 
         private IntPtr _hwnd = IntPtr.Zero;
         private bool _prewarmed;
         private bool _allowClose;
         private bool _highPrecisionTimerEnabled;
+        private bool _needsForceRestyle;
+        private int _displayRecoveryStep;
         private bool? _lastAppliedDark;
         private bool? _lastAppliedAcrylic;
 
@@ -333,6 +338,9 @@ namespace FluentOsdPro
                 Interval = TimeSpan.FromMilliseconds(MotionFrameIntervalMs)
             };
             _motionTimer.Tick += OnMotionTimerTick;
+
+            _displayRecoveryTimer = new DispatcherTimer(DispatcherPriority.Render);
+            _displayRecoveryTimer.Tick += OnDisplayRecoveryTimerTick;
         }
 
         public bool IsCurrentlyVisible =>
@@ -384,36 +392,127 @@ namespace FluentOsdPro
                 return new IntPtr(1);
             }
             if (msg == WmDisplayChange ||
+                msg == WmDpiChanged ||
                 msg == WmPowerBroadcast ||
                 msg == WmDwmCompositionChanged)
             {
-                // Re-assert DWM Acrylic & theme brushes offscreen immediately on lid close/open,
-                // battery/AC switch, sleep resume, or display topology change so the next popup never flashes white!
-                Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() =>
-                {
-                    if (_hwnd != IntPtr.Zero)
-                    {
-                        ApplyTheme(force: true);
-                        if (IsVisible)
-                        {
-                            InvalidateVisual();
-                        }
-                    }
-                }));
+                // Screen rotation / resolution / DPI / DWM / power transitions invalidate DWM's CAcrylicSheet
+                // asynchronously over ~100..450ms. Mark dirty immediately AND run multi-stage delayed re-assertions
+                // so neither active volume adjustments nor post-rotation popups ever turn transparent or stay mispositioned.
+                _lastAppliedDark = null;
+                _lastAppliedAcrylic = null;
+                _needsForceRestyle = true;
+                TaskbarMicaSync.NotifySettingChange();
+                ScheduleDisplayRecovery();
             }
             else if (msg == WmSettingChange ||
                      msg == WmThemeChanged ||
                      msg == WmDwmColorizationColorChanged)
             {
+                TaskbarMicaSync.NotifySettingChange();
                 Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() =>
                 {
                     if (_hwnd != IntPtr.Zero)
                     {
+                        ThemeService.RefreshThemeCache();
+                        TaskbarMicaSync.RefreshIfNeeded();
                         ApplyTheme(force: false);
                     }
                 }));
             }
             return IntPtr.Zero;
+        }
+
+        private void ScheduleDisplayRecovery()
+        {
+            _displayRecoveryStep = 0;
+            _displayRecoveryTimer.Stop();
+            _displayRecoveryTimer.Interval = TimeSpan.FromMilliseconds(DisplayRecoveryDelaysMs[0]);
+            _displayRecoveryTimer.Start();
+
+            Dispatcher.BeginInvoke(DispatcherPriority.Render, new Action(() =>
+            {
+                RecoverFromDisplayOrDwmChange();
+            }));
+        }
+
+        private void OnDisplayRecoveryTimerTick(object sender, EventArgs e)
+        {
+            _displayRecoveryTimer.Stop();
+            RecoverFromDisplayOrDwmChange();
+
+            _displayRecoveryStep++;
+            if (_displayRecoveryStep < DisplayRecoveryDelaysMs.Length)
+            {
+                int prevMs = DisplayRecoveryDelaysMs[_displayRecoveryStep - 1];
+                int nextDeltaMs = Math.Max(40, DisplayRecoveryDelaysMs[_displayRecoveryStep] - prevMs);
+                _displayRecoveryTimer.Interval = TimeSpan.FromMilliseconds(nextDeltaMs);
+                _displayRecoveryTimer.Start();
+            }
+        }
+
+        private void RecoverFromDisplayOrDwmChange()
+        {
+            if (_hwnd == IntPtr.Zero)
+            {
+                return;
+            }
+
+            ThemeService.RefreshThemeCache();
+            TaskbarMicaSync.RefreshIfNeeded();
+            _needsForceRestyle = false;
+            ApplyTheme(force: true, forceResetAccent: true);
+
+            if (IsCurrentlyVisible)
+            {
+                RepositionOnDisplayChange();
+                InvalidateVisual();
+                UpdateLayout();
+            }
+        }
+
+        private void RepositionOnDisplayChange()
+        {
+            bool hasVolume = _currentVolumePercent >= 0;
+            string deviceTitle = _titleBlock.Text ?? string.Empty;
+            double desiredWidthDip = ComputeDesiredWidthDip(deviceTitle, hasVolume);
+            double desiredHeightDip = VolumeBarWindowHeightDip;
+
+            OsdPlacement placement = OsdPlacementService.Calculate(
+                this,
+                desiredWidthDip,
+                desiredHeightDip,
+                OsdPosition.SameAsVolume,
+                null);
+
+            _dpiX = placement.DpiScaleX;
+            _dpiY = placement.DpiScaleY;
+            _finalTopDip = placement.FinalTop;
+            _startTopDip = placement.StartTop;
+
+            StopResizeRendering();
+            _currentWidthDip = desiredWidthDip;
+            _currentHeightDip = desiredHeightDip;
+            _currentLeftDip = placement.Left;
+            Width = desiredWidthDip;
+            Height = desiredHeightDip;
+            UpdateSliderGeometry();
+
+            if (_motionPhase == WindowMotionPhase.Entering)
+            {
+                _motionFromTopDip = _startTopDip;
+                _motionToTopDip = _finalTopDip;
+            }
+            else if (_motionPhase == WindowMotionPhase.Exiting)
+            {
+                _motionToTopDip = _startTopDip;
+            }
+            else if (_motionPhase == WindowMotionPhase.Visible)
+            {
+                ApplyWindowBounds(_currentLeftDip, _finalTopDip, _currentWidthDip, _currentHeightDip, _cardBorder.Opacity, ensureShown: false);
+            }
+
+            Program.NotifyVolumeOsdVisibilityChanged();
         }
 
         protected override void OnClosing(System.ComponentModel.CancelEventArgs e)
@@ -425,6 +524,7 @@ namespace FluentOsdPro
             }
 
             _hideTimer.Stop();
+            _displayRecoveryTimer.Stop();
             StopMotionLoop();
             StopResizeRendering();
             base.OnClosing(e);
@@ -491,8 +591,10 @@ namespace FluentOsdPro
             TaskbarMicaSync.RefreshIfNeeded();
 
             // Force DWM Acrylic & theme brush re-assertion whenever waking from Hidden state
-            // so lid-close / sleep-resume / battery-saver transitions never leave an invalid DWM surface!
-            ApplyTheme(force: !IsCurrentlyVisible);
+            // or after a display rotation / mode transition so DWM never leaves a transparent surface!
+            bool forceStyle = !IsCurrentlyVisible || _needsForceRestyle;
+            _needsForceRestyle = false;
+            ApplyTheme(force: forceStyle, forceResetAccent: forceStyle);
 
             bool hasVolume = state.VolumePercent >= 0;
             string deviceTitle = state.DeviceName ?? string.Empty;
@@ -586,7 +688,17 @@ namespace FluentOsdPro
             }
             else
             {
-                // Already visible or entering: animate horizontal width smoothly if device name length changed
+                // Already visible or entering: keep vertical anchor synced with current monitor orientation
+                // and animate horizontal width smoothly if device name length changed.
+                if (_motionPhase == WindowMotionPhase.Entering)
+                {
+                    _motionToTopDip = _finalTopDip;
+                }
+                else if (_motionPhase == WindowMotionPhase.Visible)
+                {
+                    _currentTopDip = _finalTopDip;
+                }
+
                 UpdateSliderGeometry();
                 double centerDip = placement.Left + (desiredWidthDip / 2.0);
                 if (animate && Math.Abs(desiredWidthDip - _currentWidthDip) > 1.5)
@@ -857,7 +969,7 @@ namespace FluentOsdPro
                         hPx,
                         SwpNoActivate | SwpNoOwnerZOrder | SwpNoSendChanging);
                     ShowWindow(_hwnd, SwShowNoActivate);
-                    ApplyTheme(force: true);
+                    ApplyTheme(force: true, forceResetAccent: true);
                     InvalidateVisual();
                     UpdateLayout();
                     try
@@ -926,7 +1038,7 @@ namespace FluentOsdPro
         private Color _lastAppliedAccent;
         private long _lastMicaSignature = -1;
 
-        private void ApplyTheme(bool force)
+        private void ApplyTheme(bool force, bool forceResetAccent = false)
         {
             bool isDark = ThemeService.IsSystemDarkTheme();
             bool isLight = !isDark;
@@ -934,8 +1046,8 @@ namespace FluentOsdPro
             Color accentColor = ThemeService.GetAccentColor();
             long micaSignature = TaskbarMicaSync.Signature;
 
-            bool styleChanged = force || _lastAppliedDark != isDark || _lastAppliedAcrylic != enableAcrylic ||
-                                _lastMicaSignature != micaSignature;
+            bool styleChanged = force || forceResetAccent || _lastAppliedDark != isDark ||
+                                _lastAppliedAcrylic != enableAcrylic || _lastMicaSignature != micaSignature;
             if (!styleChanged && _lastAppliedAccent == accentColor)
             {
                 return;
@@ -980,32 +1092,13 @@ namespace FluentOsdPro
 
             if (_hwnd != IntPtr.Zero)
             {
-                NativeWindowStyler.ApplyOsdWindowStyle(_hwnd, isDark, enableAcrylic, clickThrough: false);
+                NativeWindowStyler.ApplyOsdWindowStyle(
+                    _hwnd,
+                    isDark,
+                    enableAcrylic,
+                    clickThrough: false,
+                    forceResetAccent: forceResetAccent);
             }
-        }
-
-        private static Color GetAccentColor(bool isDark)
-        {
-            try
-            {
-                if (SystemParameters.WindowGlassBrush is SolidColorBrush glass)
-                {
-                    Color c = glass.Color;
-                    if (isDark)
-                    {
-                        return Color.FromRgb(
-                            (byte)Math.Min(255, c.R + 42),
-                            (byte)Math.Min(255, c.G + 42),
-                            (byte)Math.Min(255, c.B + 42));
-                    }
-                    return c;
-                }
-            }
-            catch
-            {
-            }
-
-            return isDark ? Color.FromRgb(0x60, 0xCD, 0xFF) : Color.FromRgb(0x00, 0x67, 0xC0);
         }
 
         private static SolidColorBrush CreateFrozenBrush(Color color)

@@ -34,7 +34,7 @@ namespace FluentOsdPro
         private static bool _hasColor;
         private static Color _color;
         private static long _signature;
-        private static long _lastQuickCheckTick;
+        private static long _lastQuickCheckTick = -10000L;
 
         private static string _cachedStateKey;
         private static uint _cachedSampleHash;
@@ -136,7 +136,7 @@ namespace FluentOsdPro
         /// </summary>
         public static void RefreshIfNeeded()
         {
-            long nowTick = Environment.TickCount & int.MaxValue;
+            long nowTick = Program.MonotonicTickMs();
             long lastTick = Interlocked.Read(ref _lastQuickCheckTick);
             if (nowTick - lastTick >= 0 && nowTick - lastTick < 200)
             {

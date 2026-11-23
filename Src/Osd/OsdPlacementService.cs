@@ -60,7 +60,7 @@ namespace FluentOsdPro
         private static Guid IidIUIAutomationTextPattern = new Guid("32EBA289-3583-42C9-9C59-3B6D9A1E9B6A");
         private static Guid IidIUIAutomationTextPattern2 = new Guid("506A921A-FCC9-409F-B23B-37EB74106872");
 
-        private static long _lastCaretLookupTick;
+        private static long _lastCaretLookupTick = -10000L;
         private static IntPtr _lastCaretLookupFg;
         private static bool _lastCaretLookupSuccess;
         private static int _lastCaretXPx;
@@ -68,9 +68,9 @@ namespace FluentOsdPro
         private static int _lastCaretHeightPx;
         private static string _lastCaretStrategy = string.Empty;
         private static IntPtr _lastWarmedFg;
-        private static long _lastWarmedTick;
+        private static long _lastWarmedTick = -10000L;
         private static IntPtr _lastMyGoCursorFg;
-        private static long _lastMyGoCursorTick;
+        private static long _lastMyGoCursorTick = -10000L;
         private static int _lastMyGoCursorXPx;
         private static int _lastMyGoCursorYPx;
         private static int _lastMyGoCursorHeightPx;
@@ -593,7 +593,7 @@ namespace FluentOsdPro
                 return;
             }
 
-            long now = Environment.TickCount & int.MaxValue;
+            long now = Program.MonotonicTickMs();
             if (fg == _lastWarmedFg && (now - _lastWarmedTick) < 1500)
             {
                 return;
@@ -654,7 +654,7 @@ namespace FluentOsdPro
                         lock (_caretCacheLock)
                         {
                             _lastCaretLookupFg = fg;
-                            _lastCaretLookupTick = Environment.TickCount & int.MaxValue;
+                            _lastCaretLookupTick = Program.MonotonicTickMs();
                             _lastCaretLookupSuccess = true;
                             _lastCaretXPx = cx1;
                             _lastCaretYPx = cy1;
@@ -674,7 +674,7 @@ namespace FluentOsdPro
                         lock (_caretCacheLock)
                         {
                             _lastCaretLookupFg = fg;
-                            _lastCaretLookupTick = Environment.TickCount & int.MaxValue;
+                            _lastCaretLookupTick = Program.MonotonicTickMs();
                             _lastCaretLookupSuccess = true;
                             _lastCaretXPx = cx2;
                             _lastCaretYPx = cy2;
@@ -703,9 +703,52 @@ namespace FluentOsdPro
             lock (_caretCacheLock)
             {
                 _lastCaretLookupSuccess = false;
-                _lastCaretLookupTick = 0;
+                _lastCaretLookupTick = -10000L;
             }
-            _lastMyGoCursorTick = 0;
+            _lastMyGoCursorTick = -10000L;
+        }
+
+        public static void GetMonitorGeometryFromPhysicalPoint(
+            int xPx,
+            int yPx,
+            out Win32Rect monitorRectPx,
+            out Win32Rect workAreaRectPx,
+            out double dpiScaleX,
+            out double dpiScaleY)
+        {
+            dpiScaleX = 1.0;
+            dpiScaleY = 1.0;
+            monitorRectPx = new Win32Rect { Left = 0, Top = 0, Right = 1920, Bottom = 1080 };
+            workAreaRectPx = monitorRectPx;
+
+            IntPtr hMon = MonitorFromPoint(new Win32Point { X = xPx, Y = yPx }, MonitorDefaultToNearest);
+            if (hMon == IntPtr.Zero)
+            {
+                hMon = ResolveActiveMonitor();
+            }
+
+            if (hMon != IntPtr.Zero)
+            {
+                try
+                {
+                    if (GetDpiForMonitor(hMon, 0, out uint monDpiX, out uint monDpiY) == 0 &&
+                        monDpiX > 0 && monDpiY > 0)
+                    {
+                        dpiScaleX = monDpiX / 96.0;
+                        dpiScaleY = monDpiY / 96.0;
+                    }
+                }
+                catch
+                {
+                }
+
+                Win32MonitorInfo mi = new Win32MonitorInfo { cbSize = Marshal.SizeOf(typeof(Win32MonitorInfo)) };
+                if (GetMonitorInfo(hMon, ref mi))
+                {
+                    monitorRectPx = mi.rcMonitor;
+                    workAreaRectPx = mi.rcWork;
+                }
+            }
         }
 
         /// <summary>
@@ -729,7 +772,7 @@ namespace FluentOsdPro
             {
                 try
                 {
-                    long now = Environment.TickCount & int.MaxValue;
+                    long now = Program.MonotonicTickMs();
                     if (fg != _lastWarmedFg || (now - _lastWarmedTick) >= 800)
                     {
                         _lastWarmedFg = fg;
@@ -742,7 +785,7 @@ namespace FluentOsdPro
                         lock (_caretCacheLock)
                         {
                             _lastCaretLookupFg = fg;
-                            _lastCaretLookupTick = Environment.TickCount & int.MaxValue;
+                            _lastCaretLookupTick = Program.MonotonicTickMs();
                             _lastCaretLookupSuccess = true;
                             _lastCaretXPx = cx;
                             _lastCaretYPx = cy;
@@ -773,7 +816,7 @@ namespace FluentOsdPro
                 return false;
             }
 
-            long now = Environment.TickCount & int.MaxValue;
+            long now = Program.MonotonicTickMs();
             string cachedStrategy = null;
             lock (_caretCacheLock)
             {
@@ -800,7 +843,7 @@ namespace FluentOsdPro
                 lock (_caretCacheLock)
                 {
                     _lastCaretLookupFg = fg;
-                    _lastCaretLookupTick = Environment.TickCount & int.MaxValue;
+                    _lastCaretLookupTick = Program.MonotonicTickMs();
                     _lastCaretLookupSuccess = true;
                     _lastCaretXPx = xPx;
                     _lastCaretYPx = yPx;
