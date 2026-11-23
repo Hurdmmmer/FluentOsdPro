@@ -427,6 +427,7 @@ namespace FluentOsdPro
             {
                 _lastAppliedDark = null;
                 _lastAppliedAcrylic = null;
+                Program.LogInfo("[StatusOSD] Display/DWM recovery scheduled: msg=" + FormatRecoveryMessageName(msg) + " (wParam=0x" + wParam.ToInt64().ToString("X", CultureInfo.InvariantCulture) + ", visible=" + IsCurrentlyVisible + ")");
                 _needsForceRestyle = true;
                 TaskbarMicaSync.NotifySettingChange();
                 ScheduleDisplayRecovery();
@@ -448,6 +449,15 @@ namespace FluentOsdPro
             }
 
             return IntPtr.Zero;
+        }
+
+        private static string FormatRecoveryMessageName(int msg)
+        {
+            if (msg == WmDisplayChange) return "WM_DISPLAYCHANGE";
+            if (msg == WmDpiChanged) return "WM_DPICHANGED";
+            if (msg == WmPowerBroadcast) return "WM_POWERBROADCAST";
+            if (msg == WmDwmCompositionChanged) return "WM_DWMCOMPOSITIONCHANGED";
+            return "0x" + msg.ToString("X", CultureInfo.InvariantCulture);
         }
 
         private void ScheduleDisplayRecovery()
@@ -655,6 +665,10 @@ namespace FluentOsdPro
             _iconText.Visibility = isLock ? Visibility.Collapsed : Visibility.Visible;
 
             // Update theme & wallpaper Mica/accent brushes BEFORE AnimateState -> ApplyBadgeColors
+            if (_needsForceRestyle)
+            {
+                Program.LogInfo("[StatusOSD] Applying forced DWM acrylic reset on show (pending display/DWM restyle).");
+            }
             bool forceStyle = !wasVisible || _needsForceRestyle;
             _needsForceRestyle = false;
             ApplyCurrentTheme(force: forceStyle, forceResetAccent: forceStyle);
