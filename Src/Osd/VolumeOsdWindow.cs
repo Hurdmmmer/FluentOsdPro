@@ -402,6 +402,10 @@ namespace FluentOsdPro
                 _lastAppliedDark = null;
                 _lastAppliedAcrylic = null;
                 Program.LogInfo("[VolumeOSD] Display/DWM recovery scheduled: msg=" + FormatRecoveryMessageName(msg) + " (wParam=0x" + wParam.ToInt64().ToString("X", CultureInfo.InvariantCulture) + ", visible=" + IsCurrentlyVisible + ")");
+                if (msg == WmPowerBroadcast)
+                {
+                    AudioVolumeController.OnPowerBroadcast((int)wParam.ToInt64());
+                }
                 _needsForceRestyle = true;
                 TaskbarMicaSync.NotifySettingChange();
                 ScheduleDisplayRecovery();

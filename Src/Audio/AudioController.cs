@@ -341,8 +341,10 @@ namespace FluentOsdPro
             try
             {
                 IMMDevice device;
-                if (enumerator.GetDefaultAudioEndpoint(EDataFlowRender, ERoleMultimedia, out device) != 0 || device == null)
+                int hrDefault = enumerator.GetDefaultAudioEndpoint(EDataFlowRender, ERoleMultimedia, out device);
+                if (hrDefault != 0 || device == null)
                 {
+                    Program.LogError("GetDefaultAudioEndpoint failed, hr=0x" + hrDefault.ToString("X8"), null);
                     return null;
                 }
 
@@ -350,7 +352,12 @@ namespace FluentOsdPro
                 {
                     object result;
                     int hr = device.Activate(ref iid, ClsCtxAll, IntPtr.Zero, out result);
-                    return (hr == 0 && result != null) ? result : null;
+                    if (hr != 0 || result == null)
+                    {
+                        Program.LogError("IMMDevice.Activate failed, hr=0x" + hr.ToString("X8"), null);
+                        return null;
+                    }
+                    return result;
                 }
                 finally
                 {
@@ -759,7 +766,18 @@ namespace FluentOsdPro
         // so IAudioEndpointVolumeCallback.OnNotify can distinguish our own changes from external Bluetooth AVRCP changes.
         private static readonly Guid OurVolumeEventContext = new Guid("7F8A41C2-93E5-4B18-A402-554C564F5344");
         private const float StepSize = 0.02f;
-        private static readonly object VolumeLock = new object();
+        private const int VolumeOpLockTimeoutMs = 1200;
+        private const int PbtApmSuspend = 0x0004;
+        private const int PbtApmResumeSuspend = 0x0007;
+        private const int PbtApmResumeAutomatic = 0x0012;
+
+        // Strictly separated locks to eliminate Core Audio AB-BA deadlocks:
+        // - VolumeOpLock: ONLY guards keyboard/UI volume read-write operations (never held during callback rebind/unbind).
+        // - StateLock: ONLY guards tiny in-memory tracking fields (ZERO COM calls inside this lock).
+        // - SubscriptionLock: ONLY swaps COM object references in memory (ZERO COM calls inside this lock).
+        private static readonly object VolumeOpLock = new object();
+        private static readonly object StateLock = new object();
+        private static readonly object SubscriptionLock = new object();
         private static Action<VolumeState> _onChanged;
 
         private static AudioDeviceSwitcher.IMMDeviceEnumerator _notificationEnumerator;
@@ -770,6 +788,8 @@ namespace FluentOsdPro
         private static int _lastNotifiedPercent = -1;
         private static bool? _lastNotifiedMuted;
         private static long _lastRebindTick = -10000L;
+        private static long _lastPowerResumeScheduleTick = -10000L;
+        private static int _rebindGeneration;
 
         public sealed class VolumeState
         {
@@ -790,119 +810,296 @@ namespace FluentOsdPro
             });
         }
 
+        public static void OnPowerBroadcast(int powerEvent)
+        {
+            if (powerEvent == PbtApmSuspend)
+            {
+                // Proactively detach stale endpoint COM pointer (e.g. Bluetooth headset) before suspend/hibernate
+                // so resuming without that headset cannot hang Core Audio teardown.
+                Interlocked.Increment(ref _rebindGeneration);
+                AudioDeviceSwitcher.InvalidateDefaultDeviceCache();
+                DetachSubscribedEndpointAsync("PowerSuspend");
+                return;
+            }
+
+            if (powerEvent == PbtApmResumeSuspend || powerEvent == PbtApmResumeAutomatic)
+            {
+                long now = Program.MonotonicTickMs();
+                lock (StateLock)
+                {
+                    if ((now - _lastPowerResumeScheduleTick) >= 0 && (now - _lastPowerResumeScheduleTick) < 1200)
+                    {
+                        return;
+                    }
+                    _lastPowerResumeScheduleTick = now;
+                    _subscribedDeviceId = string.Empty;
+                }
+
+                int generation = Interlocked.Increment(ref _rebindGeneration);
+                AudioDeviceSwitcher.InvalidateDefaultDeviceCache();
+                ThreadPool.QueueUserWorkItem(delegate
+                {
+                    // Allow Windows Audio & Bluetooth stacks time to finish endpoint re-enumeration after resume
+                    Thread.Sleep(1500);
+                    if (Volatile.Read(ref _rebindGeneration) != generation)
+                    {
+                        return;
+                    }
+                    Program.LogInfo("AudioVolumeController: rebinding default audio endpoint after power resume.");
+                    RebindEndpointVolumeNotification(showOsdOnDeviceSwitch: false, expectedGeneration: generation);
+                });
+            }
+        }
+
         public static void Shutdown()
         {
-            lock (VolumeLock)
+            Interlocked.Increment(ref _rebindGeneration);
+
+            IAudioEndpointVolume oldVol;
+            EndpointVolumeCallback oldCb;
+            AudioDeviceSwitcher.IMMDeviceEnumerator oldEnum;
+            DefaultDeviceNotificationClient oldClient;
+
+            lock (SubscriptionLock)
             {
-                UnbindEndpointVolumeNotificationLocked();
+                oldVol = _subscribedEndpointVolume;
+                oldCb = _volumeCallback;
+                _subscribedEndpointVolume = null;
+                _volumeCallback = null;
 
-                if (_notificationEnumerator != null && _deviceNotificationClient != null)
-                {
-                    try
-                    {
-                        _notificationEnumerator.UnregisterEndpointNotificationCallback(_deviceNotificationClient);
-                    }
-                    catch
-                    {
-                    }
-                }
-
-                if (_notificationEnumerator != null)
-                {
-                    try
-                    {
-                        Marshal.FinalReleaseComObject(_notificationEnumerator);
-                    }
-                    catch
-                    {
-                    }
-                    _notificationEnumerator = null;
-                }
+                oldEnum = _notificationEnumerator;
+                oldClient = _deviceNotificationClient;
+                _notificationEnumerator = null;
                 _deviceNotificationClient = null;
+            }
+
+            oldCb?.Detach();
+            ReleaseEndpointVolumeCom(oldVol, oldCb);
+
+            if (oldEnum != null && oldClient != null)
+            {
+                try
+                {
+                    oldEnum.UnregisterEndpointNotificationCallback(oldClient);
+                }
+                catch
+                {
+                }
+            }
+
+            if (oldEnum != null)
+            {
+                try
+                {
+                    Marshal.FinalReleaseComObject(oldEnum);
+                }
+                catch
+                {
+                }
             }
         }
 
         public static void NotifyDefaultEndpointSwitchedProgrammatically()
         {
+            int generation = Interlocked.Increment(ref _rebindGeneration);
             ThreadPool.QueueUserWorkItem(delegate
             {
-                RebindEndpointVolumeNotification(showOsdOnDeviceSwitch: false);
+                RebindEndpointVolumeNotification(showOsdOnDeviceSwitch: false, expectedGeneration: generation);
             });
         }
 
         private static void InitializeHardwareVolumeNotifications()
         {
-            lock (VolumeLock)
+            try
             {
-                try
+                bool alreadyRegistered;
+                lock (SubscriptionLock)
                 {
-                    if (_notificationEnumerator == null)
-                    {
-                        _notificationEnumerator = (AudioDeviceSwitcher.IMMDeviceEnumerator)new AudioDeviceSwitcher.MMDeviceEnumeratorComObject();
-                        _deviceNotificationClient = new DefaultDeviceNotificationClient();
-                        _notificationEnumerator.RegisterEndpointNotificationCallback(_deviceNotificationClient);
-                    }
+                    alreadyRegistered = _notificationEnumerator != null;
                 }
-                catch (Exception ex)
+
+                if (!alreadyRegistered)
                 {
-                    Program.LogError("Failed to register IMMNotificationClient", ex);
-                }
-            }
-
-            RebindEndpointVolumeNotification(showOsdOnDeviceSwitch: false);
-        }
-
-        private static void RebindEndpointVolumeNotification(bool showOsdOnDeviceSwitch)
-        {
-            VolumeState switchedState = null;
-            lock (VolumeLock)
-            {
-                try
-                {
-                    UnbindEndpointVolumeNotificationLocked();
-                    AudioDeviceSwitcher.InvalidateDefaultDeviceCache();
-
-                    IAudioEndpointVolume vol = ActivateVolume();
-                    if (vol == null)
-                    {
-                        return;
-                    }
-
-                    float level = 0.0f;
-                    bool muted = false;
-                    vol.GetMasterVolumeLevelScalar(out level);
-                    vol.GetMute(out muted);
-
-                    _lastNotifiedPercent = (int)Math.Round(level * 100.0f);
-                    _lastNotifiedMuted = muted;
-                    _lastRebindTick = Program.MonotonicTickMs();
-
-                    _volumeCallback = new EndpointVolumeCallback();
-                    int hr = vol.RegisterControlChangeNotify(_volumeCallback);
+                    AudioDeviceSwitcher.IMMDeviceEnumerator enumerator = (AudioDeviceSwitcher.IMMDeviceEnumerator)new AudioDeviceSwitcher.MMDeviceEnumeratorComObject();
+                    DefaultDeviceNotificationClient client = new DefaultDeviceNotificationClient();
+                    int hr = enumerator.RegisterEndpointNotificationCallback(client);
                     if (hr == 0)
                     {
-                        _subscribedEndpointVolume = vol;
-                        string devName = AudioDeviceSwitcher.GetDefaultDeviceDisplayName();
-                        Program.LogInfo("Bound IAudioEndpointVolumeCallback to default audio endpoint: " + devName + " (Vol=" + _lastNotifiedPercent + "%, Muted=" + muted + ")");
-                        if (showOsdOnDeviceSwitch)
+                        bool stored = false;
+                        lock (SubscriptionLock)
                         {
-                            switchedState = new VolumeState
+                            if (_notificationEnumerator == null)
                             {
-                                DeviceName = devName,
-                                Level = level,
-                                Muted = muted
-                            };
+                                _notificationEnumerator = enumerator;
+                                _deviceNotificationClient = client;
+                                stored = true;
+                            }
+                        }
+
+                        if (!stored)
+                        {
+                            try { enumerator.UnregisterEndpointNotificationCallback(client); } catch { }
+                            try { Marshal.FinalReleaseComObject(enumerator); } catch { }
                         }
                     }
                     else
                     {
-                        Marshal.FinalReleaseComObject(vol);
+                        Program.LogError("RegisterEndpointNotificationCallback failed, hr=0x" + hr.ToString("X8"), null);
+                        try { Marshal.FinalReleaseComObject(enumerator); } catch { }
                     }
                 }
-                catch (Exception ex)
+            }
+            catch (Exception ex)
+            {
+                Program.LogError("Failed to register IMMNotificationClient", ex);
+            }
+
+            int generation = Interlocked.Increment(ref _rebindGeneration);
+            RebindEndpointVolumeNotification(showOsdOnDeviceSwitch: false, expectedGeneration: generation);
+        }
+
+        private static void DetachSubscribedEndpointAsync(string reason)
+        {
+            IAudioEndpointVolume oldVol;
+            EndpointVolumeCallback oldCb;
+            lock (SubscriptionLock)
+            {
+                oldVol = _subscribedEndpointVolume;
+                oldCb = _volumeCallback;
+                _subscribedEndpointVolume = null;
+                _volumeCallback = null;
+            }
+
+            if (oldVol == null && oldCb == null)
+            {
+                return;
+            }
+
+            oldCb?.Detach();
+            if (!string.IsNullOrEmpty(reason))
+            {
+                Program.LogInfo("Detached IAudioEndpointVolumeCallback (" + reason + ").");
+            }
+
+            // Always run UnregisterControlChangeNotify + FinalReleaseComObject off any lock and off the rebind path,
+            // because a disconnected Bluetooth COM proxy can stall inside AudioSes.dll during teardown.
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                ReleaseEndpointVolumeCom(oldVol, oldCb);
+            });
+        }
+
+        private static void ReleaseEndpointVolumeCom(IAudioEndpointVolume vol, EndpointVolumeCallback cb)
+        {
+            if (vol == null)
+            {
+                return;
+            }
+
+            try
+            {
+                if (cb != null)
                 {
-                    Program.LogError("RebindEndpointVolumeNotification failed", ex);
+                    vol.UnregisterControlChangeNotify(cb);
                 }
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                Marshal.FinalReleaseComObject(vol);
+            }
+            catch
+            {
+            }
+        }
+
+        private static void RebindEndpointVolumeNotification(bool showOsdOnDeviceSwitch, int expectedGeneration)
+        {
+            VolumeState switchedState = null;
+            try
+            {
+                DetachSubscribedEndpointAsync(null);
+                AudioDeviceSwitcher.InvalidateDefaultDeviceCache();
+
+                if (Volatile.Read(ref _rebindGeneration) != expectedGeneration)
+                {
+                    return;
+                }
+
+                IAudioEndpointVolume vol = ActivateVolume();
+                if (vol == null)
+                {
+                    Program.LogError("RebindEndpointVolumeNotification: ActivateVolume returned null.", null);
+                    return;
+                }
+
+                float level = 0.0f;
+                bool muted = false;
+                vol.GetMasterVolumeLevelScalar(out level);
+                vol.GetMute(out muted);
+
+                EndpointVolumeCallback newCallback = new EndpointVolumeCallback();
+                int hr = vol.RegisterControlChangeNotify(newCallback);
+                if (hr != 0)
+                {
+                    Program.LogError("RegisterControlChangeNotify failed, hr=0x" + hr.ToString("X8"), null);
+                    try { Marshal.FinalReleaseComObject(vol); } catch { }
+                    return;
+                }
+
+                bool superseded = Volatile.Read(ref _rebindGeneration) != expectedGeneration;
+                if (superseded)
+                {
+                    newCallback.Detach();
+                    ReleaseEndpointVolumeCom(vol, newCallback);
+                    return;
+                }
+
+                IAudioEndpointVolume prevVol;
+                EndpointVolumeCallback prevCb;
+                lock (SubscriptionLock)
+                {
+                    prevVol = _subscribedEndpointVolume;
+                    prevCb = _volumeCallback;
+                    _subscribedEndpointVolume = vol;
+                    _volumeCallback = newCallback;
+                }
+
+                if (prevVol != null || prevCb != null)
+                {
+                    prevCb?.Detach();
+                    ThreadPool.QueueUserWorkItem(delegate
+                    {
+                        ReleaseEndpointVolumeCom(prevVol, prevCb);
+                    });
+                }
+
+                int pct = (int)Math.Round(level * 100.0f);
+                lock (StateLock)
+                {
+                    _lastNotifiedPercent = pct;
+                    _lastNotifiedMuted = muted;
+                    _lastRebindTick = Program.MonotonicTickMs();
+                }
+
+                string devName = AudioDeviceSwitcher.GetDefaultDeviceDisplayName();
+                Program.LogInfo("Bound IAudioEndpointVolumeCallback to default audio endpoint: " + devName + " (Vol=" + pct + "%, Muted=" + muted + ")");
+                if (showOsdOnDeviceSwitch)
+                {
+                    switchedState = new VolumeState
+                    {
+                        DeviceName = devName,
+                        Level = level,
+                        Muted = muted
+                    };
+                }
+            }
+            catch (Exception ex)
+            {
+                Program.LogError("RebindEndpointVolumeNotification failed", ex);
             }
 
             if (switchedState != null && _onChanged != null)
@@ -911,41 +1108,13 @@ namespace FluentOsdPro
             }
         }
 
-        private static void UnbindEndpointVolumeNotificationLocked()
-        {
-            if (_subscribedEndpointVolume != null)
-            {
-                try
-                {
-                    if (_volumeCallback != null)
-                    {
-                        _subscribedEndpointVolume.UnregisterControlChangeNotify(_volumeCallback);
-                    }
-                }
-                catch
-                {
-                }
-
-                try
-                {
-                    Marshal.FinalReleaseComObject(_subscribedEndpointVolume);
-                }
-                catch
-                {
-                }
-                _subscribedEndpointVolume = null;
-            }
-            _volumeCallback = null;
-        }
-
         private static void OnExternalHardwareVolumeChanged(float level, bool muted)
         {
             // Immediately suppress the native Windows volume flyout triggered by Bluetooth AVRCP
             Program.SuppressNativeVolumeFlyout("BluetoothAvrcpNotify");
 
             int pct = (int)Math.Round(Math.Max(0.0f, Math.Min(1.0f, level)) * 100.0f);
-            string devName;
-            lock (VolumeLock)
+            lock (StateLock)
             {
                 long now = Program.MonotonicTickMs();
                 bool inConnectGracePeriod = (now - _lastRebindTick) >= 0 && (now - _lastRebindTick) < 1800;
@@ -963,9 +1132,9 @@ namespace FluentOsdPro
                 }
                 _lastNotifiedPercent = pct;
                 _lastNotifiedMuted = muted;
-                devName = AudioDeviceSwitcher.GetDefaultDeviceDisplayName();
             }
 
+            string devName = AudioDeviceSwitcher.GetDefaultDeviceDisplayName();
             Program.LogInfo("External/Bluetooth AVRCP volume change detected -> " + devName + " (" + pct + "%, Muted=" + muted + ")");
             if (_onChanged != null)
             {
@@ -1000,8 +1169,16 @@ namespace FluentOsdPro
 
         public static VolumeState GetCurrentState()
         {
-            lock (VolumeLock)
+            bool lockTaken = false;
+            try
             {
+                Monitor.TryEnter(VolumeOpLock, VolumeOpLockTimeoutMs, ref lockTaken);
+                if (!lockTaken)
+                {
+                    Program.LogError("GetCurrentState timed out waiting for VolumeOpLock.", null);
+                    return null;
+                }
+
                 IAudioEndpointVolume volume = ActivateVolume();
                 if (volume == null)
                 {
@@ -1028,12 +1205,27 @@ namespace FluentOsdPro
                     Marshal.FinalReleaseComObject(volume);
                 }
             }
+            finally
+            {
+                if (lockTaken)
+                {
+                    Monitor.Exit(VolumeOpLock);
+                }
+            }
         }
 
         public static VolumeState GetStateForDevice(string deviceId, string displayName)
         {
-            lock (VolumeLock)
+            bool lockTaken = false;
+            try
             {
+                Monitor.TryEnter(VolumeOpLock, VolumeOpLockTimeoutMs, ref lockTaken);
+                if (!lockTaken)
+                {
+                    Program.LogError("GetStateForDevice timed out waiting for VolumeOpLock.", null);
+                    return null;
+                }
+
                 Guid iid = IidIAudioEndpointVolume;
                 IAudioEndpointVolume volume = (IAudioEndpointVolume)AudioDeviceSwitcher.ActivateRenderEndpointInterface(deviceId, iid);
                 if (volume == null)
@@ -1061,6 +1253,13 @@ namespace FluentOsdPro
                     Marshal.FinalReleaseComObject(volume);
                 }
             }
+            finally
+            {
+                if (lockTaken)
+                {
+                    Monitor.Exit(VolumeOpLock);
+                }
+            }
         }
 
         public static void TriggerToggleMute()
@@ -1084,11 +1283,20 @@ namespace FluentOsdPro
 
         private static VolumeState StepVolumeCore(bool up)
         {
-            lock (VolumeLock)
+            bool lockTaken = false;
+            try
             {
+                Monitor.TryEnter(VolumeOpLock, VolumeOpLockTimeoutMs, ref lockTaken);
+                if (!lockTaken)
+                {
+                    Program.LogError("StepVolumeCore timed out waiting for VolumeOpLock.", null);
+                    return null;
+                }
+
                 IAudioEndpointVolume volume = ActivateVolume();
                 if (volume == null)
                 {
+                    Program.LogError("StepVolumeCore: ActivateVolume returned null.", null);
                     return null;
                 }
 
@@ -1116,8 +1324,11 @@ namespace FluentOsdPro
 
                     bool muted;
                     volume.GetMute(out muted);
-                    _lastNotifiedPercent = (int)Math.Round(next * 100.0f);
-                    _lastNotifiedMuted = muted;
+                    lock (StateLock)
+                    {
+                        _lastNotifiedPercent = (int)Math.Round(next * 100.0f);
+                        _lastNotifiedMuted = muted;
+                    }
 
                     return new VolumeState
                     {
@@ -1131,15 +1342,31 @@ namespace FluentOsdPro
                     Marshal.FinalReleaseComObject(volume);
                 }
             }
+            finally
+            {
+                if (lockTaken)
+                {
+                    Monitor.Exit(VolumeOpLock);
+                }
+            }
         }
 
         private static VolumeState ToggleMuteCore()
         {
-            lock (VolumeLock)
+            bool lockTaken = false;
+            try
             {
+                Monitor.TryEnter(VolumeOpLock, VolumeOpLockTimeoutMs, ref lockTaken);
+                if (!lockTaken)
+                {
+                    Program.LogError("ToggleMuteCore timed out waiting for VolumeOpLock.", null);
+                    return null;
+                }
+
                 IAudioEndpointVolume volume = ActivateVolume();
                 if (volume == null)
                 {
+                    Program.LogError("ToggleMuteCore: ActivateVolume returned null.", null);
                     return null;
                 }
 
@@ -1163,8 +1390,11 @@ namespace FluentOsdPro
 
                     float level;
                     volume.GetMasterVolumeLevelScalar(out level);
-                    _lastNotifiedPercent = (int)Math.Round(level * 100.0f);
-                    _lastNotifiedMuted = !muted;
+                    lock (StateLock)
+                    {
+                        _lastNotifiedPercent = (int)Math.Round(level * 100.0f);
+                        _lastNotifiedMuted = !muted;
+                    }
 
                     return new VolumeState
                     {
@@ -1176,6 +1406,13 @@ namespace FluentOsdPro
                 finally
                 {
                     Marshal.FinalReleaseComObject(volume);
+                }
+            }
+            finally
+            {
+                if (lockTaken)
+                {
+                    Monitor.Exit(VolumeOpLock);
                 }
             }
         }
@@ -1207,9 +1444,16 @@ namespace FluentOsdPro
 
         private sealed class EndpointVolumeCallback : IAudioEndpointVolumeCallback
         {
+            private volatile bool _detached;
+
+            public void Detach()
+            {
+                _detached = true;
+            }
+
             public int OnNotify(IntPtr pNotify)
             {
-                if (pNotify == IntPtr.Zero)
+                if (_detached || pNotify == IntPtr.Zero)
                 {
                     return 0;
                 }
@@ -1233,7 +1477,10 @@ namespace FluentOsdPro
                     bool muted = data.bMuted;
                     ThreadPool.QueueUserWorkItem(delegate
                     {
-                        OnExternalHardwareVolumeChanged(level, muted);
+                        if (!_detached)
+                        {
+                            OnExternalHardwareVolumeChanged(level, muted);
+                        }
                     });
                 }
                 catch
@@ -1269,9 +1516,10 @@ namespace FluentOsdPro
                     return 0;
                 }
 
+                // NEVER acquire any COM-holding lock inside Core Audio's MMDevApi notification thread!
                 string newId = pwstrDefaultDeviceId ?? string.Empty;
                 long now = Program.MonotonicTickMs();
-                lock (VolumeLock)
+                lock (StateLock)
                 {
                     if (string.Equals(_subscribedDeviceId, newId, StringComparison.OrdinalIgnoreCase) &&
                         (now - _lastRebindTick) >= 0 && (now - _lastRebindTick) < 400)
@@ -1284,6 +1532,7 @@ namespace FluentOsdPro
 
                 bool wasProgrammatic = (now - AudioDeviceSwitcher.LastProgrammaticSwitchTick) >= 0 &&
                                        (now - AudioDeviceSwitcher.LastProgrammaticSwitchTick) < 600;
+                int generation = Interlocked.Increment(ref _rebindGeneration);
                 ThreadPool.QueueUserWorkItem(delegate
                 {
                     // Allow Bluetooth AVRCP endpoint properties 120ms to settle when newly connected
@@ -1291,9 +1540,13 @@ namespace FluentOsdPro
                     {
                         Thread.Sleep(120);
                     }
+                    if (Volatile.Read(ref _rebindGeneration) != generation)
+                    {
+                        return;
+                    }
                     // Never pop up the Volume OSD merely because a Bluetooth headset connected or disconnected;
                     // only rebind silently so subsequent volume adjustments on the headset trigger the OSD.
-                    RebindEndpointVolumeNotification(showOsdOnDeviceSwitch: false);
+                    RebindEndpointVolumeNotification(showOsdOnDeviceSwitch: false, expectedGeneration: generation);
                 });
                 return 0;
             }
